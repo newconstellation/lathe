@@ -304,6 +304,7 @@ MainComponent::MainComponent() {
     timeline_.onTrackMenu = [this](int track) { showTrackMenu(track); };
     pqList_.setMultipleSelectionEnabled(true);
     recent_.fromString(props_.getUserSettings()->getValue("recentSessions"));
+    warnLaneExport_ = props_.getUserSettings()->getBoolValue("warnLaneExport", true);
     playColour_ = playBtn_.findColour(juce::TextButton::buttonColourId);
 
     auto& h = pqList_.getHeader();
@@ -543,6 +544,8 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
     switch (id) {
         case cmd::undo: info.setActive(!undo_.isEmpty()); break;
         case cmd::exportSelectedTracks: info.setActive(!timeline_.selectedTracks().isEmpty()); break;
+        case cmd::warnLaneExport: info.setTicked(warnLaneExport_); break;
+        case cmd::zoomRegion: info.setActive(activeTimeline().selectedRegion() != 0); break;
         case cmd::redo: info.setActive(!redo_.isEmpty()); break;
         case cmd::toggleEnvelope: info.setTicked(timeline_.envelopeMode()); break;
         case cmd::toggleSnap: info.setTicked(snapBtn_.getToggleState()); break;
@@ -603,10 +606,22 @@ bool MainComponent::perform(const InvocationInfo& info) {
     }
     switch (info.commandID) {
         case cmd::closeSession: closeSession(); break;
+        case cmd::zoomRegion:
+            if (auto* zr = activeSession().findRegion(activeTimeline().selectedRegion())) activeTimeline().zoomToRange({zr->start, zr->end()});
+            break;
+        case cmd::lanesTaller: timeline_.zoomLanes(1.25); break;
+        case cmd::lanesShorter: timeline_.zoomLanes(0.8); break;
+        case cmd::lanesReset: timeline_.resetLaneHeights(); break;
+        case cmd::alignRegions: showAlign(); break;
+        case cmd::setSyncPoint: setSyncPoint(); break;
+        case cmd::warnLaneExport:
+            warnLaneExport_ = !warnLaneExport_;
+            props_.getUserSettings()->setValue("warnLaneExport", warnLaneExport_);
+            break;
         case cmd::exportSelectedTracks: withLaneCheck([this] { exportTracks(selectedTracks()); }); break;
         case cmd::repairWindow: showRepair(); break;
         case cmd::repairInOut: repairInOut(0); break;
-        case cmd::newSession: newSession(); break;
+        case cmd::newSession: confirmDiscard("starting a new one", [this] { newSession(); }); break;
         case cmd::openSession: openSession(); break;
         case cmd::saveSession: saveSession(false); break;
         case cmd::saveSessionAs: saveSession(true); break;
@@ -964,7 +979,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             add({cmd::batchRender});
             m.addSeparator();
             add({cmd::exportDdp, cmd::exportTrackWavs, cmd::exportProgram24, cmd::exportTracksAs, cmd::exportSelectedTracks, cmd::exportProgrammeAs, cmd::exportInOut,
-                 cmd::exportSegments});
+                 cmd::exportSegments, cmd::warnLaneExport});
             break;
         case 1:
             add({cmd::undo, cmd::redo});
@@ -1003,6 +1018,8 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             }
             add({cmd::regionEffects, cmd::bypassRegionFx});
             m.addSeparator();
+            add({cmd::alignRegions, cmd::setSyncPoint});
+            m.addSeparator();
             add({cmd::repairWindow, cmd::repairInOut, cmd::restoreRegion, cmd::spectralEditor});
             m.addSeparator();
             add({cmd::nudgeLeft, cmd::nudgeRight, cmd::nudgeLeftBig, cmd::nudgeRightBig});
@@ -1033,7 +1050,9 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             add({cmd::addSrp, cmd::addSrpText, cmd::srpsFromSelection, cmd::prevSrp, cmd::nextSrp, cmd::lockSrp, cmd::deleteSrp, cmd::deleteAllSrps});
             break;
         case 4:
-            add({cmd::zoomIn, cmd::zoomOut, cmd::zoomFit, cmd::zoomSelection, cmd::scrollLeft, cmd::scrollRight});
+            add({cmd::zoomIn, cmd::zoomOut, cmd::zoomFit, cmd::zoomSelection, cmd::zoomRegion, cmd::scrollLeft, cmd::scrollRight});
+            m.addSeparator();
+            add({cmd::lanesTaller, cmd::lanesShorter, cmd::lanesReset});
             m.addSeparator();
             add({cmd::toggleEnvelope, cmd::toggleSnap, cmd::crossfadeEditor, cmd::toggleLoudness});
             m.addSeparator();
@@ -2877,6 +2896,8 @@ void MainComponent::newSession() {
     refWindow_.reset();
     analysisWindow_.reset();
     session_ = Session();
+    exportNote_.clear();
+    if (auto* w = findParentComponentOfClass<juce::DocumentWindow>()) w->setName("Lathe - Untitled");
     repairWindow_.reset();
     repairItems_.clear();
     repairRegion_ = 0;
@@ -2943,9 +2964,11 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
 }
 
 void MainComponent::openSession() {
-    chooser_ = std::make_unique<juce::FileChooser>("Open session", juce::File(), "*.lathe");
-    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                          [this](const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) loadSessionFile(fc.getResult()); });
+    confirmDiscard("opening another", [this] {
+        chooser_ = std::make_unique<juce::FileChooser>("Open session", juce::File(), "*.lathe");
+        chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                              [this](const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) loadSessionFile(fc.getResult()); });
+    });
 }
 
 bool MainComponent::saveSession(bool saveAs, std::function<void()> then) {
@@ -2968,7 +2991,21 @@ bool MainComponent::saveSession(bool saveAs, std::function<void()> then) {
                                                        .getChildFile((session_.discTitle.isEmpty() ? juce::String("Untitled") : session_.discTitle) + ".lathe"),
                                                    "*.lathe");
     chooser_->launchAsync(juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::warnAboutOverwriting,
-                          [doSave](const juce::FileChooser& fc) { if (fc.getResult() != juce::File()) doSave(fc.getResult().withFileExtension("lathe")); });
+                          [this, doSave](const juce::FileChooser& fc) {
+                              if (fc.getResult() == juce::File()) return;
+                              const auto f = fc.getResult().withFileExtension("lathe");
+                              // Saving over a different session: say exactly what would be replaced.
+                              if (f.existsAsFile() && f != session_.file) {
+                                  auto options = juce::MessageBoxOptions::makeOptionsOkCancel(
+                                      juce::MessageBoxIconType::WarningIcon, "Replace another session?",
+                                      "\"" + f.getFileNameWithoutExtension() + "\" is a different session, last saved " +
+                                          f.getLastModificationTime().toString(true, true, false) + ".\n\nSaving here replaces it with the session that is open now.",
+                                      "Replace It", "Cancel");
+                                  juce::AlertWindow::showAsync(options, [doSave, f](int r) { if (r == 1) doSave(f); });
+                                  return;
+                              }
+                              doSave(f);
+                          });
     return true;
 }
 
@@ -3771,6 +3808,7 @@ void MainComponent::refreshIssues() {
         if (!r.file.existsAsFile()) missing.addIfNotAlreadyThere(r.file.getFileName());
     for (auto& m : missing) { ++errors; s << "ERROR  Missing file: " << m << "\n"; }
     if (takeReport_.isNotEmpty()) s << takeReport_ << "\n";
+    if (exportNote_.isNotEmpty()) s << exportNote_ << "\n";
     juce::String head = juce::String(int(disc.tracks.size())) + " tracks, " + msfString(session_.end()) + ". ";
     head << (errors ? juce::String(errors) + " problem(s) to fix before DDP.\n" : "Ready for DDP.\n");
     issues_.setText(head + s);
@@ -4972,7 +5010,6 @@ void MainComponent::closeSession() {
         srcSession_ = Session();
         newSession();
         dirty_ = false;
-        if (auto* w = findParentComponentOfClass<juce::DocumentWindow>()) w->setName("Lathe");
     };
     if (!dirty_ || (session_.regions.isEmpty() && session_.markers.isEmpty() && session_.file == juce::File())) { close(); return; }
     const auto name = session_.file != juce::File() ? session_.file.getFileNameWithoutExtension() : juce::String("this session");
@@ -5030,12 +5067,180 @@ void MainComponent::menuItemSelected(int id, int) {
 
 void MainComponent::withLaneCheck(std::function<void()> go) {
     const auto w = session_.laneStateWarning();
-    if (w.isEmpty()) { go(); return; }
-    auto options = juce::MessageBoxOptions::makeOptionsOkCancel(
-        juce::MessageBoxIconType::WarningIcon, "Export what you are hearing?",
-        "Right now " + w + ".\n\nExports, DDP images and batch renders deliver exactly what plays, so this will be left out or changed in the files too.",
-        "Export Anyway", "Cancel");
-    juce::AlertWindow::showAsync(options, [go](int r) { if (r == 1) go(); });
+    exportNote_ = w.isEmpty() ? juce::String() : "Export   made while " + w + ": the files are what was playing.";
+    refreshIssues();
+    if (w.isEmpty() || !warnLaneExport_) { go(); return; }
+    auto* aw = new juce::AlertWindow("Export what you are hearing?",
+                                     "Right now " + w + ".\n\nExports, DDP images and batch renders deliver exactly what plays, so this will be left out or changed in the files too.",
+                                     juce::MessageBoxIconType::WarningIcon);
+    auto never = std::make_shared<juce::ToggleButton>("Don't show this again (File > Warn Before Exporting with Lanes Muted turns it back on)");
+    never->setSize(470, 24);
+    aw->addCustomComponent(never.get());
+    aw->addButton("Export Anyway", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    aw->enterModalState(true, juce::ModalCallbackFunction::create([this, go, never](int r) {
+        if (r != 1) { exportNote_.clear(); refreshIssues(); return; }
+        if (never->getToggleState()) {
+            warnLaneExport_ = false;
+            props_.getUserSettings()->setValue("warnLaneExport", false);
+            commands_.commandStatusChanged();
+        }
+        go();
+    }), true);
+}
+
+void MainComponent::confirmDiscard(const juce::String& verb, std::function<void()> then) {
+    if (!dirty_ || (session_.regions.isEmpty() && session_.markers.isEmpty())) { then(); return; }
+    const auto name = session_.file != juce::File() ? "\"" + session_.file.getFileNameWithoutExtension() + "\"" : juce::String("this session");
+    auto options = juce::MessageBoxOptions::makeOptionsYesNoCancel(juce::MessageBoxIconType::QuestionIcon, "Save changes?",
+                                                                   "Save the changes to " + name + " before " + verb + "?", "Save", "Don't Save", "Cancel");
+    juce::AlertWindow::showAsync(options, [this, then](int r) {
+        if (r == 1) saveSession(false, then);
+        else if (r == 2) then();
+    });
+}
+
+// ---------------------------------------------------------------- align
+
+void MainComponent::setSyncPoint() {
+    auto* r = session_.findRegion(timeline_.selectedRegion());
+    const double t = timeline_.editPoint();
+    if (!r || t < r->start || t >= r->end()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Set Sync Point",
+                                               "Select a region and put the Edit Point on the spot to line up: a clap, a count-in, a downbeat.");
+        return;
+    }
+    const auto p = r->srcIn + juce::int64(std::llround((t - r->start) * r->fileRate));
+    r->syncPoint = std::abs(r->syncPoint - p) <= 1 ? -1 : p;   // again on the same spot: remove it
+    sessionChanged();
+}
+
+void MainComponent::showAlign() {
+    auto* ref = session_.findRegion(timeline_.selectedRegion());
+    juce::Array<int> others;
+    if (ref)
+        for (auto& r : session_.regions)
+            if (r.id != ref->id) others.add(r.id);
+    if (!ref || others.isEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Align Regions",
+                                               "Select the region the others should line up with (the reference). There must be at least one other region on the timeline.");
+        return;
+    }
+    struct Picker : juce::Component {
+        juce::OwnedArray<juce::ToggleButton> boxes;
+        juce::Viewport view;
+        juce::Component inner;
+        juce::Array<int> ids;
+        Picker() { addAndMakeVisible(view); view.setViewedComponent(&inner, false); view.setScrollBarsShown(true, false); }
+        void resized() override { view.setBounds(getLocalBounds()); }
+    };
+    auto pick = std::make_shared<Picker>();
+    const int refId = ref->id;
+    const auto refFile = ref->file;
+    const juce::Range<double> refSpan(ref->start, ref->end());
+    for (int id : others) {
+        auto* r = session_.findRegion(id);
+        auto* b = pick->boxes.add(new juce::ToggleButton(r->name + "   (lane " + juce::String(r->lane + 1) + ", at " + msfString(r->start) + ")"));
+        // Ticked to begin with: other recordings, when there are only a few or they sit alongside the reference.
+        b->setToggleState(r->file != refFile && (others.size() <= 8 || refSpan.intersects({r->start, r->end()})), juce::dontSendNotification);
+        b->setBounds(4, (pick->boxes.size() - 1) * 24, 500, 22);
+        pick->inner.addAndMakeVisible(b);
+        pick->ids.add(id);
+    }
+    pick->inner.setSize(510, pick->boxes.size() * 24 + 2);
+    pick->setSize(530, juce::jmin(240, pick->boxes.size() * 24 + 4));
+    auto* aw = new juce::AlertWindow("Align Regions",
+                                     "Line these up with \"" + ref->name + "\" and stack them on the lanes under it. The reference does not move.",
+                                     juce::MessageBoxIconType::NoIcon);
+    aw->addCustomComponent(pick.get());
+    aw->addComboBox("how", {"By matching the audio (the same recording, or the same performance)", "By sync points (Edit > Set Sync Point at Edit Point, on each region)"}, "Line up");
+    if (ref->syncPoint >= 0) aw->getComboBoxComponent("how")->setSelectedItemIndex(1);
+    aw->addButton("Align", 1, juce::KeyPress(juce::KeyPress::returnKey));
+    aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+    aw->enterModalState(true, juce::ModalCallbackFunction::create([this, aw, pick, refId](int result) {
+        if (result != 1) return;
+        const bool bySync = aw->getComboBoxComponent("how")->getSelectedItemIndex() == 1;
+        auto* rf = session_.findRegion(refId);
+        if (!rf) return;
+        struct Item { Region reg; bool ok = false; juce::String note; double newStart = 0, score = 1; bool inverted = false; };
+        auto items = std::make_shared<std::vector<Item>>();
+        for (int i = 0; i < pick->boxes.size(); ++i)
+            if (pick->boxes[i]->getToggleState())
+                if (auto* r = session_.findRegion(pick->ids[i])) { Item it; it.reg = *r; items->push_back(it); }
+        if (items->empty()) return;
+        auto refCopy = std::make_shared<Region>(*rf);
+        runJob("Lining up...",
+               [this, items, refCopy, bySync](Job& j) {
+                   const auto& A = *refCopy;
+                   const int n = int(items->size());
+                   for (int i = 0; i < n; ++i) {
+                       auto& it = (*items)[size_t(i)];
+                       const auto& B = it.reg;
+                       if (bySync) {
+                           if (A.syncPoint < 0) { it.note = "the reference has no sync point"; continue; }
+                           if (B.syncPoint < 0) { it.note = "no sync point on this region"; continue; }
+                           it.newStart = A.start + double(A.syncPoint - A.srcIn) / A.fileRate - double(B.syncPoint - B.srcIn) / B.fileRate;
+                           it.ok = true;
+                           continue;
+                       }
+                       if (B.file == A.file) {   // the same file: its own timing lines it up
+                           it.newStart = A.start + double(B.srcIn - A.srcIn) / A.fileRate;
+                           it.ok = true;
+                           continue;
+                       }
+                       auto res = alignFiles(engine_.formats(), A.file, B.file, [&](double p) { return j.keep((i + juce::jlimit(0.0, 1.0, p)) / n); });
+                       if (!res.ok) { it.note = res.error; if (res.error == "Cancelled.") return; continue; }
+                       it.score = res.score;
+                       it.inverted = res.inverted;
+                       if (res.score < 0.15) { it.note = "no match found with the reference"; continue; }
+                       it.newStart = A.start + double(B.srcIn - A.srcIn - res.offset) / A.fileRate;
+                       it.ok = true;
+                   }
+               },
+               [this, items, refId, bySync](bool cancelled) {
+                   if (cancelled || !session_.findRegion(refId)) return;
+                   juce::String text;
+                   int placed = 0;
+                   for (auto& it : *items) {
+                       auto* r = session_.findRegion(it.reg.id);
+                       auto* rf2 = session_.findRegion(refId);
+                       if (!r || !rf2) continue;
+                       text << r->name << "\n";
+                       if (!it.ok) { text << "  Left where it was: " << it.note << ".\n\n"; continue; }
+                       double start = it.newStart;
+                       if (start < 0) {   // would begin before the start of the timeline: its head is trimmed instead
+                           const auto cut = juce::int64(std::ceil(-start * r->fileRate));
+                           if (cut >= r->srcOut - r->srcIn) { text << "  Left where it was: all of it falls before the start of the timeline.\n\n"; continue; }
+                           r->srcIn += cut;
+                           start += double(cut) / r->fileRate;
+                           text << "  Its first " << juce::String(double(cut) / r->fileRate, 3) << " s fall before the start of the timeline and were trimmed.\n";
+                       }
+                       const double moved = start - it.reg.start, len = r->end() - r->start;
+                       int lane = rf2->lane + (++placed);
+                       bool free = lane < session_.lanes;
+                       if (free)
+                           for (auto& o : session_.regions)
+                               if (o.id != r->id && o.lane == lane && o.start < start + len && o.end() > start) { free = false; break; }
+                       if (!free) session_.insertLane(lane);
+                       r = session_.findRegion(it.reg.id);
+                       r->start = juce::jmax(0.0, start);
+                       r->lane = lane;
+                       text << "  Moved " << juce::String(std::abs(moved), 4) << " s " << (moved < 0 ? "earlier" : "later") << " (" << juce::String(juce::int64(std::llround(std::abs(moved) * r->fileRate)))
+                            << " samples), onto lane " << (lane + 1) << (free ? "" : ", a new lane") << ".\n";
+                       if (!bySync && it.reg.file != session_.findRegion(refId)->file) {
+                           text << "  Match with the reference: " << juce::String(juce::roundToInt(it.score * 100.0)) << "%"
+                                << (it.score > 0.95 ? " (the same recording)." : it.score > 0.5 ? " (the same performance)." : ". A weak match: check it by ear before trusting it.") << "\n";
+                           if (it.inverted) text << "  Its polarity is inverted against the reference: summed with it, they will cancel.\n";
+                       }
+                       text << "\n";
+                   }
+                   sessionChanged();
+                   timeline_.resized();
+                   timeline_.selectRegion(refId);
+                   text << "One Undo (Cmd+Z) puts everything back.\n";
+                   showText("Align", text);
+               });
+    }), true);
 }
 
 // ---------------------------------------------------------------- track selection

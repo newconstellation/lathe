@@ -114,6 +114,11 @@ public:
     std::function<void(double)> onProblemClicked;
 
     void zoomToFit();
+    double pixelsPerSecond() const { return pps_; }
+    // Lane heights: all lanes together (factor > 1 = taller), or back to sharing the window.
+    void zoomLanes(double factor);
+    void resetLaneHeights();
+    static constexpr double kMinPps = 0.02;
     void zoomToRange(juce::Range<double> r);
     void scrollBy(double fractionOfWidth);
     void zoomBy(double factor, double aroundSec);
@@ -175,11 +180,17 @@ private:
     // A unit edge under p in the product strip: unit index and which end; false if none.
     bool unitEdgeAt(juce::Point<int> p, int& unit, bool& isEnd) const;
     struct UnitDrag { int unit = -1; bool isEnd = false; int linked = -1; bool linkedIsEnd = false; double orig = 0; } unitDrag_;
-    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint, SrpMove, TrackBar, GainNode, UnitEdge };
+    enum class Drag { None, Locate, Select, Move, TrimStart, TrimEnd, FadeIn, FadeOut, Marker, EnvPoint, SrpMove, TrackBar, GainNode, UnitEdge, LaneSize };
 
     double xToTime(float x) const { return view0_ + double(x) / pps_; }
     float timeToX(double t) const { return float((t - view0_) * pps_); }
-    int laneHeight() const;
+    int laneHeight() const;                   // a lane at its natural size (all lanes sharing the window)
+    int laneHeightOf(int lane) const;         // as drawn: natural size x the session's lane zoom x that lane's own factor
+    int lanesTotalHeight() const;
+    int lanesAreaHeight() const { return getHeight() - top() - kScroll; }
+    int laneEdgeAt(juce::Point<int> p) const; // the lane whose bottom edge is under p (in its header), or -1
+    void clampVScroll();
+    double maxPps() const;                    // furthest zoom in: about one sample per pixel
     juce::Rectangle<int> laneBounds(int lane) const;
     int laneAt(int y) const;
     int regionAt(juce::Point<int> p) const;   // region id or 0
@@ -203,7 +214,10 @@ private:
     double in_ = -1, out_ = -1, edit_ = 0;
     bool active_ = false;
     int selSrp_ = 0;
-    juce::ScrollBar hscroll_{false};
+    juce::ScrollBar hscroll_{false}, vscroll_{true};
+    int vOffset_ = 0;                         // lanes scrolled up by this many pixels
+    int sizeLane_ = -1, sizeY0_ = 0;
+    double sizeScale0_ = 1.0;
     double pps_ = 20.0, view0_ = 0.0;
     double playhead_ = 0;
     int selRegion_ = 0, selLane_ = 0, selMarker_ = 0;

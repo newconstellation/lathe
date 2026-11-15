@@ -298,6 +298,48 @@ int main() {
         CHECK(nr.inverted);
         CHECK(std::abs(nr.gainDiffDb - 0.5) < 0.01);
         CHECK(nr.residualRmsGainMatched < 1e-5);
+        // Align uses the same search: the offset, the polarity and how sure it is.
+        auto al = alignFiles(fm, fa, fb, {});
+        CHECK(al.ok && al.offset == 123 && al.inverted && al.score > 0.95);
+        auto back = alignFiles(fm, fb, fa, {});
+        CHECK(back.ok && back.offset == -123);
+        // Unrelated audio scores low, so Align leaves it alone; a different rate is refused with a reason.
+        auto fu = dir.getChildFile("unrelated.wav"), f48 = dir.getChildFile("at48.wav");
+        for (auto& spec : {std::pair<juce::File, double>{fu, 44100.0}, std::pair<juce::File, double>{f48, 48000.0}}) {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(spec.first.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), spec.second, 2, 32, {}, 0));
+            os.release();
+            juce::Random rnd(4242);
+            juce::AudioBuffer<float> n(2, 44100 * 4);
+            for (int ch = 0; ch < 2; ++ch) for (int i = 0; i < n.getNumSamples(); ++i) n.setSample(ch, i, (rnd.nextFloat() - 0.5f) * 0.5f);
+            w->writeFromAudioSampleBuffer(n, 0, n.getNumSamples());
+        }
+        auto un = alignFiles(fm, fa, fu, {});
+        std::printf("align: unrelated audio scores %.3f\n", un.score);
+        CHECK(un.ok && un.score < 0.15);
+        auto wrongRate = alignFiles(fm, fa, f48, {});
+        CHECK(!wrongRate.ok && wrongRate.error.contains("kHz"));
+        // Lane heights and sync points are kept with the session, and follow their lanes.
+        {
+            Session ls;
+            ls.lanes = 3;
+            ls.laneZoom = 1.5;
+            ls.setLaneScale(1, 2.0);
+            auto rg = ls.makeRegion(fa, 44100, 44100 * 4);
+            rg.syncPoint = 12345;
+            ls.regions.add(rg);
+            auto lf = dir.getChildFile("lanes.lathe");
+            juce::String err;
+            CHECK(ls.save(lf, err));
+            Session lb;
+            CHECK(lb.load(lf, err));
+            CHECK(std::abs(lb.laneZoom - 1.5) < 1e-9 && std::abs(lb.laneScaleOf(1) - 2.0) < 1e-9 && std::abs(lb.laneScaleOf(0) - 1.0) < 1e-9);
+            CHECK(lb.regions.size() == 1 && lb.regions[0].syncPoint == 12345);
+            lb.insertLane(0);
+            CHECK(std::abs(lb.laneScaleOf(2) - 2.0) < 1e-9 && std::abs(lb.laneScaleOf(0) - 1.0) < 1e-9);
+            CHECK(lb.deleteLane(0) && std::abs(lb.laneScaleOf(1) - 2.0) < 1e-9);
+        }
         // Identical files are reported bit-identical.
         auto same = nullTest(fm, fa, fa, {}, {});
         CHECK(same.ok && same.offset == 0 && same.residualPeak == 0.0);

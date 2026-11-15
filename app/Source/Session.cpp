@@ -463,6 +463,7 @@ void Session::insertLane(int at) {
         for (auto& l : *list)
             if (l >= at) ++l;
     if (at < laneFormats.size()) laneFormats.insert(at, 2);
+    if (at < laneScale.size()) laneScale.insert(at, 1.0);
     ++lanes;
 }
 
@@ -478,6 +479,7 @@ bool Session::deleteLane(int lane) {
             if (l > lane) --l;
     }
     if (lane < laneFormats.size()) laneFormats.remove(lane);
+    if (lane < laneScale.size()) laneScale.remove(lane);
     --lanes;
     return true;
 }
@@ -1315,6 +1317,7 @@ juce::var Session::toVar() const {
             for (auto& p : r.patches) pl.add(juce::Array<juce::var>{p.pos, p.length, p.file, p.offset});
             o->setProperty("patches", pl);
         }
+        if (r.syncPoint >= 0) o->setProperty("syncPoint", r.syncPoint);
         if (r.afterGear != 0) {
             o->setProperty("afterGear", r.afterGear);
             juce::Array<juce::var> po;
@@ -1425,6 +1428,13 @@ juce::var Session::toVar() const {
     laneList("lanesSolo", lanesSolo);
     laneList("lanesGainOff", lanesGainOff);
     laneList("lanesGainShown", lanesGainShown);
+    if (std::abs(laneZoom - 1.0) > 1e-6) root->setProperty("laneZoom", laneZoom);
+    {
+        bool any = false;
+        juce::Array<juce::var> a;
+        for (double f : laneScale) { a.add(f); any = any || std::abs(f - 1.0) > 1e-6; }
+        if (any) root->setProperty("laneScale", a);
+    }
     bool anyFormat = false;
     for (int f : laneFormats) anyFormat = anyFormat || f != 2;
     if (anyFormat) {
@@ -1458,6 +1468,8 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     lanesSolo.clear();
     lanesGainOff.clear();
     lanesGainShown.clear();
+    laneZoom = 1.0;
+    laneScale.clear();
     laneFormats.clear();
     sourceDoc = juce::var();
     nextId = 1;
@@ -1543,6 +1555,7 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             if (auto* pl = o["patches"].getArray())
                 for (auto& p : *pl)
                     if (p.isArray() && p.size() == 4 && int(p[1]) > 0) r.patches.add({juce::int64(p[0]), int(p[1]), p[2].toString(), juce::int64(p[3])});
+            r.syncPoint = juce::int64(o.getProperty("syncPoint", -1));
             r.afterGear = int(o.getProperty("afterGear", 0));
             if (auto* po = o["printOf"].getArray())
                 for (auto& id : *po) r.printOf.add(int(id));
@@ -1673,6 +1686,9 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     laneList("lanesSolo", lanesSolo);
     laneList("lanesGainOff", lanesGainOff);
     laneList("lanesGainShown", lanesGainShown);
+    laneZoom = juce::jlimit(0.3, 6.0, double(v.getProperty("laneZoom", 1.0)));
+    if (auto* arr = v["laneScale"].getArray())
+        for (int i = 0; i < arr->size(); ++i) setLaneScale(i, double(arr->getReference(i)));
     if (auto* arr = v["laneFormats"].getArray())
         for (int i = 0; i < arr->size(); ++i) setLaneFormat(i, int(arr->getReference(i)));
     sourceDoc = v["source"];

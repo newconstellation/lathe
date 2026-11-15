@@ -226,6 +226,12 @@ private:
     juce::Component::SafePointer<SegmentListPanel> textViewPanel_;
     void runAnalogBlack();
     // ---- 0.15: recent sessions, track selection, repairs, take checks ----
+    // ---- 0.16
+    bool warnLaneExport_ = true;
+    juce::String exportNote_;
+    void confirmDiscard(const juce::String& verb, std::function<void()> then);   // asks to save changes first
+    void showAlign();
+    void setSyncPoint();
     RecentSessions recent_;
     void noteRecent(const juce::File& f);
     void openRecent(int index);

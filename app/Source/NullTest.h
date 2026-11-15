@@ -42,6 +42,19 @@ struct NullResult {
     juce::String toText(const juce::String& nameA, const juce::String& nameB) const;
 };
 
+// Where two files line up: B lags A by `offset` samples (negative = B leads). `score` is how well
+// they match there, 0..1: about 1 for copies of one recording, lower for different microphones or
+// takes of the same performance, near 0 for unrelated audio.
+struct AlignResult {
+    bool ok = false;
+    juce::String error;
+    juce::int64 offset = 0;
+    bool inverted = false;
+    double score = 0;
+    double rate = 0;
+};
+AlignResult alignFiles(juce::AudioFormatManager& fm, const juce::File& a, const juce::File& b, const std::function<bool(double)>& progress);
+
 // Runs on a background thread. `progress` 0..1, return false to cancel.
 // If differenceFile is not empty, writes A - B (aligned, gain as-is) as 32-bit float WAV.
 NullResult nullTest(juce::AudioFormatManager& fm, const juce::File& a, const juce::File& b, const juce::File& differenceFile,

@@ -194,6 +194,35 @@ int main() {
             v.lanesSolo = {1};
             CHECK(!v.laneAudible(0) && v.laneAudible(1));
         }
+        // Lane heights: all together, one by one, scrolling when they no longer fit; and zoom limits.
+        {
+            Session v = s;
+            v.lanes = 4;
+            Timeline tv(v, pool);
+            tv.setSize(1200, 420);
+            tv.zoomToFit();
+            const int y1 = tv.laneButton(1, 0).getY() - tv.laneButton(0, 0).getY();   // one lane's height
+            tv.zoomLanes(2.0);
+            const int y2 = tv.laneButton(1, 0).getY() - tv.laneButton(0, 0).getY();
+            CHECK(y2 >= y1 * 2 - 2 && y2 <= y1 * 2 + 2);
+            v.setLaneScale(1, 0.5);
+            tv.zoomLanes(1.0);
+            const int h1 = tv.laneButton(1, 0).getY() - tv.laneButton(0, 0).getY();   // lane 2 alone is half
+            CHECK(h1 >= y2 / 2 - 2 && h1 <= y2 / 2 + 2);
+            snap(tv, "lanes-tall");
+            tv.resetLaneHeights();
+            CHECK(tv.laneButton(1, 0).getY() - tv.laneButton(0, 0).getY() == y1);
+            CHECK(std::abs(v.laneZoom - 1.0) < 1e-9 && v.laneScale.isEmpty());
+            // Zoom: in to about a sample per pixel, out to hours across the window.
+            for (int i = 0; i < 200; ++i) tv.zoomBy(2.0, 1.0);
+            CHECK(tv.pixelsPerSecond() >= v.effectiveRate() - 1.0 && tv.pixelsPerSecond() <= juce::jmax(20000.0, v.effectiveRate()) + 1.0);
+            snap(tv, "zoom-max");
+            for (int i = 0; i < 200; ++i) tv.zoomBy(0.5, 1.0);
+            CHECK(tv.pixelsPerSecond() <= 0.021);
+            const auto reg = v.regions[0];
+            tv.zoomToRange({reg.start, reg.end()});
+            CHECK(tv.pixelsPerSecond() * (reg.end() - reg.start) <= 1200.0 && tv.pixelsPerSecond() * (reg.end() - reg.start) > 900.0);
+        }
         // The Repair window: its list keeps ticks, counts them, and closes cleanly.
         {
             RepairPanel rp;

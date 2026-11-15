@@ -63,6 +63,7 @@ struct Region {
     int afterGear = 0;
     juce::Array<int> printOf;            // the regions muted in its favour (to switch back to the live gear)
     juce::Array<Patch> patches;          // repairs, in source-file positions (later ones win where they overlap)
+    juce::int64 syncPoint = -1;          // a spot to line up with other regions (source-file sample; -1 = none)
 
     double length() const { return double(srcOut - srcIn) / fileRate; }
     double end() const { return start + length(); }
@@ -210,6 +211,15 @@ public:
     // soloed lanes play; a lane with its gain off plays flat (no gain line, no segment gain).
     juce::Array<int> lanesMuted, lanesSolo, lanesGainOff;
     juce::Array<int> lanesGainShown;   // lanes showing their gain line for editing (the G button)
+    // How tall lanes are drawn: one factor for all of them, and one per lane (missing = 1).
+    double laneZoom = 1.0;
+    juce::Array<double> laneScale;
+    double laneScaleOf(int lane) const { return juce::isPositiveAndBelow(lane, laneScale.size()) ? laneScale[lane] : 1.0; }
+    void setLaneScale(int lane, double f) {
+        if (lane < 0) return;
+        while (laneScale.size() <= lane) laneScale.add(1.0);
+        laneScale.set(lane, juce::jlimit(0.3, 6.0, f));
+    }
     bool laneAudible(int lane) const { return lanesSolo.isEmpty() ? !lanesMuted.contains(lane) : lanesSolo.contains(lane); }
     // Something is muted, soloed or flat: one line saying what (for export warnings), or empty.
     juce::String laneStateWarning() const;

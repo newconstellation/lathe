@@ -64,6 +64,10 @@ enum : juce::CommandID {
     // Added in 0.15
     closeSession = 0x10a0, exportSelectedTracks,
     repairWindow = 0x14e0, repairInOut,
+    // Added in 0.16
+    zoomRegion = 0x1740, lanesTaller, lanesShorter, lanesReset,
+    alignRegions = 0x14f0, setSyncPoint,
+    warnLaneExport = 0x10b0,
 };
 }  // namespace cmd
 

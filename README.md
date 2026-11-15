@@ -228,6 +228,34 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
   - the plugin buttons sit directly under the plugin list, with a labelled "Problems & notes" box
     below.
 
+## Align, lane heights, deeper zoom, Zoom to Region (v0.16)
+
+- **Align Regions** (Edit > Align Regions..., Cmd+Option+A). Select the region the others
+  should line up with, tick the ones to move, and choose how:
+  - *By matching the audio*: finds where each one matches the reference, however far apart they
+    sit. Copies of the same recording (two machines, 24-bit and 32-bit float) line up to the
+    sample; different microphones or takes of the same performance line up on their best
+    match. The report gives a match figure for each, and says when a match is weak or the
+    polarity is inverted. Audio that doesn't match is left where it was.
+  - *By sync points*: put the Edit Point on the same spot in each region (a clap, a downbeat)
+    and choose Edit > Set Sync Point at Edit Point. A small blue diamond marks it.
+  - Aligned regions go onto the lanes directly under the reference, at the matching time; new
+    lanes are added when those are occupied. The reference never moves. One Undo puts it all
+    back.
+- **Lane heights.** View > Taller Lanes / Shorter Lanes (Cmd+Option+Down / Up) sizes every lane;
+  drag a lane's bottom edge, at its left end, to size just that one (double-click the edge to
+  reset it); View > Reset Lane Heights. When lanes no longer fit, the wheel scrolls them and a
+  scroll bar appears at the right (Shift+wheel, or a sideways swipe, still scrolls time).
+  Heights are saved with the session.
+- **Zoom** goes in to about one sample per pixel and out to many hours across the window.
+- **Zoom to Region** (View, Cmd+Option+0) fits the selected region without touching the In-Out.
+- **Export warning**: "Don't show this again" on the warning about muted, soloed or gain-off
+  lanes. File > Warn Before Exporting with Lanes Muted turns it back on. With it off, the
+  errors field still notes what the last export left out.
+- **New Session** clears the name in the title bar ("Lathe - Untitled"), and New, Open and Open
+  Recent ask to save changes first. Saving over a different session's file asks, naming that
+  session and when it was last saved.
+
 ## Repairs, recording health, lane buttons, track selection, Close and Open Recent (v0.15)
 
 - **Repair** (Edit > Repair..., Cmd+Option+D). The recording itself is never changed: a repair

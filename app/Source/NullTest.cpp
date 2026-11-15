@@ -349,25 +349,13 @@ juce::String clickFile(juce::AudioFormatReader& A, juce::AudioFormatReader& B, j
 
 }  // namespace
 
-NullResult nullTest(juce::AudioFormatManager& fm, const juce::File& fa, const juce::File& fb, const juce::File& diffFile,
-                    const std::function<bool(double)>& progress) {
-    NullResult r;
-    std::unique_ptr<juce::AudioFormatReader> A(fm.createReaderFor(fa)), B(fm.createReaderFor(fb));
-    if (!A || !B) { r.error = "Couldn't read " + (!A ? fa.getFileName() : fb.getFileName()); return r; }
-    r.rateA = A->sampleRate;
-    r.rateB = B->sampleRate;
-    r.bitsA = int(A->bitsPerSample);
-    r.bitsB = int(B->bitsPerSample);
-    r.lengthA = A->lengthInSamples;
-    r.lengthB = B->lengthInSamples;
-    if (std::abs(r.rateA - r.rateB) > 0.5) {
-        r.error = "The files are at different sample rates (" + juce::String(r.rateA) + " vs " + juce::String(r.rateB) +
-                  " Hz). Render both at the same rate to compare them sample for sample.";
-        return r;
-    }
-    auto stage = [&progress](double p) { return !progress || progress(p); };
-    auto cancelled = [&r] { r.error = "Cancelled."; return r; };
-
+// The offset at which B best matches A: a search around "started together", then coarse offsets
+// from the whole of both files' decimated envelopes, each refined to the sample. `ok` false = cancelled.
+static Fine findAlignment(juce::AudioFormatReader& A_, juce::AudioFormatReader& B_, const std::function<bool(double)>& stage, bool& ok) {
+    auto* A = &A_;
+    auto* B = &B_;
+    struct { double rateA; juce::int64 lengthA, lengthB; } r{A->sampleRate, A->lengthInSamples, B->lengthInSamples};
+    ok = true;
     // ---- Alignment. Candidate 1: cross-correlation around the first loud passage of A within
     // +/- min(2 s, 65536) samples (files started together). Then coarse offsets from the whole of
     // both files' decimated envelopes, each refined to the sample. The best-correlating wins.
@@ -392,13 +380,38 @@ NullResult nullTest(juce::AudioFormatManager& fm, const juce::File& fa, const ju
         const juce::int64 longest = juce::jmax(r.lengthA, r.lengthB);
         while (longest / D > (juce::int64(1) << 21)) D <<= 1;
         std::vector<double> ea, eb;
-        if (!envelope(*A, D, ea, [&stage](double f) { return stage(0.1 * f); })) return cancelled();
-        if (!envelope(*B, D, eb, [&stage](double f) { return stage(0.1 + 0.1 * f); })) return cancelled();
+        if (!envelope(*A, D, ea, [&stage](double f) { return stage(0.1 * f); })) { ok = false; return best; }
+        if (!envelope(*B, D, eb, [&stage](double f) { return stage(0.1 + 0.1 * f); })) { ok = false; return best; }
         for (const auto& c : coarseCandidates(ea, eb, D, N)) {
             auto f = fineAlign(*A, *B, c.startA, c.centre, c.maxLag, N);
             if (f.score > best.score) best = f;
         }
     }
+    return best;
+}
+
+NullResult nullTest(juce::AudioFormatManager& fm, const juce::File& fa, const juce::File& fb, const juce::File& diffFile,
+                    const std::function<bool(double)>& progress) {
+    NullResult r;
+    std::unique_ptr<juce::AudioFormatReader> A(fm.createReaderFor(fa)), B(fm.createReaderFor(fb));
+    if (!A || !B) { r.error = "Couldn't read " + (!A ? fa.getFileName() : fb.getFileName()); return r; }
+    r.rateA = A->sampleRate;
+    r.rateB = B->sampleRate;
+    r.bitsA = int(A->bitsPerSample);
+    r.bitsB = int(B->bitsPerSample);
+    r.lengthA = A->lengthInSamples;
+    r.lengthB = B->lengthInSamples;
+    if (std::abs(r.rateA - r.rateB) > 0.5) {
+        r.error = "The files are at different sample rates (" + juce::String(r.rateA) + " vs " + juce::String(r.rateB) +
+                  " Hz). Render both at the same rate to compare them sample for sample.";
+        return r;
+    }
+    auto stage = [&progress](double p) { return !progress || progress(p); };
+    auto cancelled = [&r] { r.error = "Cancelled."; return r; };
+
+    bool alignedOk = true;
+    const Fine best = findAlignment(*A, *B, stage, alignedOk);
+    if (!alignedOk) return cancelled();
     r.offset = best.offset;
     r.inverted = best.inverted;
     if (!stage(0.2)) return cancelled();
@@ -642,6 +655,26 @@ juce::String NullResult::toText(const juce::String& nameA, const juce::String& n
             s << "  ... and " << juce::String(differenceCount - differences.size()) << " more (" << juce::String(differenceCount) << " in all).\n";
     }
     return s;
+}
+
+AlignResult alignFiles(juce::AudioFormatManager& fm, const juce::File& a, const juce::File& b, const std::function<bool(double)>& progress) {
+    AlignResult r;
+    std::unique_ptr<juce::AudioFormatReader> A(fm.createReaderFor(a)), B(fm.createReaderFor(b));
+    if (!A || !B) { r.error = "Can't read " + (A ? b : a).getFileName() + "."; return r; }
+    if (std::abs(A->sampleRate - B->sampleRate) > 0.5) {
+        r.error = a.getFileName() + " is " + juce::String(A->sampleRate / 1000.0, 1) + " kHz and " + b.getFileName() + " is " +
+                  juce::String(B->sampleRate / 1000.0, 1) + " kHz: they can only be lined up at the same sample rate.";
+        return r;
+    }
+    bool ok = true;
+    const Fine f = findAlignment(*A, *B, [&progress](double p) { return !progress || progress(p * 5.0); }, ok);
+    if (!ok) { r.error = "Cancelled."; return r; }
+    r.ok = true;
+    r.offset = f.offset;
+    r.inverted = f.inverted;
+    r.score = f.score;
+    r.rate = A->sampleRate;
+    return r;
 }
 
 }  // namespace lathe

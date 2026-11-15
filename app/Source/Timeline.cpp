@@ -20,23 +20,77 @@ Timeline::Timeline(Session& s, ThumbPool& pool, Role role) : s_(s), pool_(pool),
     addAndMakeVisible(hscroll_);
     hscroll_.addListener(this);
     hscroll_.setAutoHide(false);
+    addChildComponent(vscroll_);
+    vscroll_.addListener(this);
+    vscroll_.setAutoHide(false);
     setWantsKeyboardFocus(false);
 }
 
-Timeline::~Timeline() { hscroll_.removeListener(this); }
+Timeline::~Timeline() { hscroll_.removeListener(this); vscroll_.removeListener(this); }
 
 int Timeline::laneHeight() const {
     int avail = getHeight() - top() - kScroll;
     return juce::jmax(40, avail / juce::jmax(1, s_.lanes));
 }
 
+int Timeline::laneHeightOf(int lane) const {
+    return juce::jmax(26, int(std::lround(laneHeight() * s_.laneZoom * s_.laneScaleOf(lane))));
+}
+
+int Timeline::lanesTotalHeight() const {
+    int h = 0;
+    for (int l = 0; l < s_.lanes; ++l) h += laneHeightOf(l);
+    return h;
+}
+
 juce::Rectangle<int> Timeline::laneBounds(int lane) const {
-    return {0, top() + lane * laneHeight(), getWidth(), laneHeight()};
+    int y = top() - vOffset_;
+    for (int l = 0; l < lane && l < s_.lanes; ++l) y += laneHeightOf(l);
+    return {0, y, getWidth(), laneHeightOf(lane)};
 }
 
 int Timeline::laneAt(int y) const {
-    return juce::jlimit(0, s_.lanes - 1, (y - top()) / laneHeight());
+    int edge = top() - vOffset_;
+    for (int l = 0; l < s_.lanes; ++l) {
+        edge += laneHeightOf(l);
+        if (y < edge) return l;
+    }
+    return juce::jmax(0, s_.lanes - 1);
 }
+
+// The grab strip for sizing one lane: its bottom edge, in the header at the left (clear of the badge
+// and the M / S / G buttons, which sit just above it).
+int Timeline::laneEdgeAt(juce::Point<int> p) const {
+    if (p.x > 220 || p.y < top() + 8 || p.y > getHeight() - kScroll) return -1;
+    for (int l = 0; l < s_.lanes; ++l)
+        if (std::abs(p.y - laneBounds(l).getBottom()) <= 3) return l;
+    return -1;
+}
+
+void Timeline::clampVScroll() {
+    const int total = lanesTotalHeight(), area = juce::jmax(1, lanesAreaHeight());
+    vOffset_ = juce::jlimit(0, juce::jmax(0, total - area), vOffset_);
+    vscroll_.setBounds(getWidth() - 10, top(), 10, juce::jmax(0, lanesAreaHeight()));
+    vscroll_.setVisible(total > area + 1);
+    vscroll_.setRangeLimits(0.0, double(juce::jmax(total, area)), juce::dontSendNotification);
+    vscroll_.setCurrentRange(double(vOffset_), double(area), juce::dontSendNotification);
+}
+
+void Timeline::zoomLanes(double factor) {
+    s_.laneZoom = juce::jlimit(0.3, 6.0, s_.laneZoom * factor);
+    clampVScroll();
+    repaint();
+}
+
+void Timeline::resetLaneHeights() {
+    s_.laneZoom = 1.0;
+    s_.laneScale.clear();
+    vOffset_ = 0;
+    clampVScroll();
+    repaint();
+}
+
+double Timeline::maxPps() const { return juce::jmax(20000.0, s_.effectiveRate()); }
 
 int Timeline::regionAt(juce::Point<int> p) const {
     if (p.y < top()) return 0;
@@ -214,7 +268,7 @@ void Timeline::paintLoudness(juce::Graphics& g) {
 
 void Timeline::zoomToFit() {
     double len = juce::jmax(10.0, s_.end() + 2.0);
-    pps_ = juce::jmax(0.5, double(getWidth()) / len);
+    pps_ = juce::jmax(kMinPps, double(getWidth()) / len);
     view0_ = 0;
     updateScrollbar();
     repaint();
@@ -222,7 +276,7 @@ void Timeline::zoomToFit() {
 
 void Timeline::zoomToRange(juce::Range<double> r) {
     if (r.getLength() <= 0) return;
-    pps_ = juce::jlimit(0.2, 20000.0, double(getWidth()) / (r.getLength() * 1.1));
+    pps_ = juce::jlimit(kMinPps, maxPps(), double(getWidth()) / (r.getLength() * 1.1));
     view0_ = juce::jmax(0.0, r.getStart() - r.getLength() * 0.05);
     updateScrollbar();
     repaint();
@@ -236,7 +290,7 @@ void Timeline::scrollBy(double f) {
 
 void Timeline::zoomBy(double f, double around) {
     double x = (around - view0_) * pps_;
-    pps_ = juce::jlimit(0.2, 20000.0, pps_ * f);
+    pps_ = juce::jlimit(kMinPps, maxPps(), pps_ * f);
     view0_ = juce::jmax(0.0, around - x / pps_);
     updateScrollbar();
     repaint();
@@ -253,15 +307,18 @@ void Timeline::updateScrollbar() {
     double total = juce::jmax(s_.end() + 30.0, view0_ + getWidth() / pps_);
     hscroll_.setRangeLimits(0.0, total, juce::dontSendNotification);
     hscroll_.setCurrentRange(view0_, getWidth() / pps_, juce::dontSendNotification);
+    clampVScroll();
 }
 
-void Timeline::scrollBarMoved(juce::ScrollBar*, double start) {
-    view0_ = start;
+void Timeline::scrollBarMoved(juce::ScrollBar* bar, double start) {
+    if (bar == &vscroll_) vOffset_ = int(std::lround(start));
+    else view0_ = start;
     repaint();
 }
 
 void Timeline::resized() {
     hscroll_.setBounds(getLocalBounds().removeFromBottom(kScroll));
+    vscroll_.setBounds(getWidth() - 10, top(), 10, juce::jmax(0, lanesAreaHeight()));
     updateScrollbar();
 }
 
@@ -478,6 +535,19 @@ void Timeline::paintRegion(juce::Graphics& g, int i) {
             for (auto& pt : r.envelope) g.fillEllipse(timeToX(r.start + pt.t) - 3.5f, envY(r, pt.db) - 3.5f, 7, 7);
     }
 
+    // Sync point: a small diamond on the spot Align lines up.
+    if (r.syncPoint >= r.srcIn && r.syncPoint < r.srcOut) {
+        const float sx = timeToX(r.start + double(r.syncPoint - r.srcIn) / r.fileRate);
+        if (sx > -8 && sx < float(getWidth()) + 8) {
+            juce::Path d;
+            d.addQuadrilateral(sx, box.getY() + 3, sx + 5, box.getY() + 9, sx, box.getY() + 15, sx - 5, box.getY() + 9);
+            g.setColour(juce::Colour(0xff39c2c9));
+            g.fillPath(d);
+            g.setColour(juce::Colour(0xff39c2c9).withAlpha(0.6f));
+            g.drawVerticalLine(int(sx), box.getY() + 15, box.getBottom() - 2);
+        }
+    }
+
     // Repairs: a small tick under each repaired spot.
     if (!r.patches.isEmpty()) {
         g.setColour(juce::Colour(0xff5fd17a));
@@ -515,6 +585,8 @@ void Timeline::paintRegion(juce::Graphics& g, int i) {
 
 void Timeline::paint(juce::Graphics& g) {
     g.fillAll(colours::panel);
+    g.saveState();   // lanes can be scrolled: nothing of them is drawn over the strips above
+    g.reduceClipRegion(0, top(), getWidth(), juce::jmax(0, lanesAreaHeight()));
     for (int l = 0; l < s_.lanes; ++l) {
         auto b = laneBounds(l);
         g.setColour(l % 2 ? colours::panel : colours::panel.brighter(0.02f));
@@ -539,6 +611,7 @@ void Timeline::paint(juce::Graphics& g) {
             }
 
     paintLiveTake(g);
+    g.restoreState();
     if (!selection().isEmpty()) {
         float a = timeToX(in_), b = timeToX(out_);
         g.setColour(colours::selection);
@@ -753,6 +826,7 @@ void Timeline::paintPoints(juce::Graphics& g) {
     }
     // Lane targets: D / S when edits use the lane, N when they leave it alone.
     for (int l = 0; l < s_.lanes; ++l) {
+        if (badgeBounds(l).getY() < top() || badgeBounds(l).getBottom() > getHeight() - kScroll) continue;
         auto b = badgeBounds(l).toFloat();
         const bool on = s_.laneTargeted(l);
         g.setColour(on ? colours::accent : colours::panel2);
@@ -766,6 +840,7 @@ void Timeline::paintPoints(juce::Graphics& g) {
     // Lane buttons: Mute, Solo, Gain line.
     if (role_ == Role::Destination)
         for (int l = 0; l < s_.lanes; ++l) {
+            if (badgeBounds(l).getY() < top() || badgeBounds(l).getBottom() > getHeight() - kScroll) continue;
             const bool muted = s_.lanesMuted.contains(l), solo = s_.lanesSolo.contains(l), gOff = s_.lanesGainOff.contains(l), gShown = s_.lanesGainShown.contains(l);
             struct B { const char* text; bool on; juce::Colour c; };
             const B buttons[3] = {{"M", muted, juce::Colour(0xffe0605a)},
@@ -781,7 +856,7 @@ void Timeline::paintPoints(juce::Graphics& g) {
             }
             if (!s_.laneAudible(l)) {   // not heard, so not exported: dim the lane
                 g.setColour(colours::bg.withAlpha(0.55f));
-                g.fillRect(laneBounds(l).reduced(0, 1));
+                g.fillRect(laneBounds(l).reduced(0, 1).getIntersection({0, top(), getWidth(), juce::jmax(0, lanesAreaHeight())}));
                 g.setColour(colours::dim);
                 g.setFont(juce::FontOptions(11.0f, juce::Font::bold));
                 g.drawText(muted && s_.lanesSolo.isEmpty() ? "MUTED" : "NOT SOLOED", laneButton(l, 2).translated(24, 0).withWidth(90), juce::Justification::centredLeft);
@@ -796,6 +871,7 @@ void Timeline::paintPoints(juce::Graphics& g) {
         const float x = timeToX(sp.t);
         if (x < 0 || x > getWidth() || sp.lane >= s_.lanes) continue;
         auto lb = laneBounds(sp.lane);
+        if (lb.getY() < top()) continue;
         juce::Path tri;
         tri.addTriangle(x - 5, float(lb.getY() + 2), x + 5, float(lb.getY() + 2), x, float(lb.getY() + 11));
         const auto spotColour = sp.certain ? juce::Colour(0xffe0504a) : juce::Colour(0xfff0c43a);
@@ -876,6 +952,7 @@ void Timeline::mouseMove(const juce::MouseEvent& e) {
     int ui = -1;
     bool ue = false;
     if (markerAt(e.getPosition())) cursor = juce::MouseCursor::LeftRightResizeCursor;
+    else if (role_ == Role::Destination && laneEdgeAt(e.getPosition()) >= 0) cursor = juce::MouseCursor::UpDownResizeCursor;
     else if (unitEdgeAt(e.getPosition(), ui, ue)) cursor = juce::MouseCursor::LeftRightResizeCursor;
     else if (int id = regionAt(e.getPosition())) {
         auto* r = s_.findRegion(id);
@@ -897,10 +974,19 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
     auto p = e.getPosition();
     if (onFocus) onFocus();
 
+    // Drag a lane's bottom edge (in its header) to make that lane taller or shorter.
+    if (role_ == Role::Destination && !e.mods.isPopupMenu())
+        if (int l = laneEdgeAt(p); l >= 0 && !markerAt(p)) {
+            drag_ = Drag::LaneSize;
+            sizeLane_ = l;
+            sizeY0_ = e.y;
+            sizeScale0_ = s_.laneScaleOf(l);
+            return;
+        }
     if (role_ == Role::Destination)
         for (int l = 0; l < s_.lanes; ++l)
             for (int k = 0; k < 3; ++k) {
-                if (!laneButton(l, k).contains(p)) continue;
+                if (!laneButton(l, k).contains(p) || p.y < top()) continue;
                 auto toggle = [l](juce::Array<int>& list) { if (list.contains(l)) list.removeAllInstancesOf(l); else list.add(l); };
                 if (k == 2) {
                     if (e.mods.isAltDown()) toggle(s_.lanesGainOff);   // Option-click: the lane's gain changes off / on
@@ -922,7 +1008,7 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
                 return;
             }
     for (int l = 0; l < s_.lanes; ++l)
-        if (badgeBounds(l).contains(p)) {
+        if (badgeBounds(l).contains(p) && p.y >= top()) {
             if (e.mods.isPopupMenu()) { if (onLaneMenu) onLaneMenu(l); return; }
             if (s_.laneTargeted(l)) s_.lanesOff.addIfNotAlreadyThere(l); else s_.lanesOff.removeAllInstancesOf(l);
             if (onEdit) onEdit();
@@ -1129,6 +1215,13 @@ void Timeline::mouseDown(const juce::MouseEvent& e) {
 void Timeline::mouseDrag(const juce::MouseEvent& e) {
     double t = xToTime(float(e.x));
     switch (drag_) {
+        case Drag::LaneSize: {
+            const double base = juce::jmax(1.0, laneHeight() * s_.laneZoom);
+            s_.setLaneScale(sizeLane_, sizeScale0_ + double(e.y - sizeY0_) / base);
+            clampVScroll();
+            repaint();
+            return;
+        }
         case Drag::Locate:
             setEditPoint(juce::jmax(0.0, t));
             if (onSeek) onSeek(juce::jmax(0.0, t));
@@ -1254,6 +1347,13 @@ void Timeline::mouseUp(const juce::MouseEvent&) {
 }
 
 void Timeline::mouseDoubleClick(const juce::MouseEvent& e) {
+    if (role_ == Role::Destination)
+        if (int l = laneEdgeAt(e.getPosition()); l >= 0 && !markerAt(e.getPosition())) {   // back to its natural height
+            s_.setLaneScale(l, 1.0);
+            clampVScroll();
+            repaint();
+            return;
+        }
     if (int sp = srpAt(e.getPosition())) { if (onSrpEdit) onSrpEdit(sp); return; }
     if (int m = markerAt(e.getPosition())) { if (onMarkerDoubleClicked) onMarkerDoubleClicked(m); return; }
     if (trackBarH() > 0 && e.y >= trackBarY() && e.y < top()) {
@@ -1294,6 +1394,13 @@ void Timeline::mouseDoubleClick(const juce::MouseEvent& e) {
 void Timeline::mouseWheelMove(const juce::MouseEvent& e, const juce::MouseWheelDetails& w) {
     if (e.mods.isCommandDown() || e.mods.isCtrlDown()) {
         zoomBy(w.deltaY > 0 ? 1.15 : 1 / 1.15, xToTime(float(e.x)));
+        return;
+    }
+    // Lanes taller than the window: an up-down wheel scrolls the lanes, a sideways one (or Shift) scrolls time.
+    if (vscroll_.isVisible() && std::abs(w.deltaY) > std::abs(w.deltaX) && !e.mods.isShiftDown() && e.y >= top()) {
+        vOffset_ -= int(std::lround(w.deltaY * 240.0));
+        clampVScroll();
+        repaint();
         return;
     }
     double dx = (std::abs(w.deltaX) > std::abs(w.deltaY) ? -w.deltaX : -w.deltaY) * 300.0 / pps_;
