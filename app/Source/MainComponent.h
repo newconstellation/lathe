@@ -12,6 +12,9 @@
 #include "SegmentList.h"
 #include "AutoMarks.h"
 #include "Restore.h"
+#include "RecentSessions.h"
+#include "Repair.h"
+#include "RepairPanel.h"
 #include "Commands.h"
 #include "EditPanels.h"
 #include "Exporter.h"
@@ -51,11 +54,13 @@ public:
     bool perform(const InvocationInfo& info) override;
     juce::StringArray getMenuBarNames() override;
     juce::PopupMenu getMenuForIndex(int index, const juce::String& name) override;
-    void menuItemSelected(int, int) override {}
+    void menuItemSelected(int id, int) override;
 
     Session& session() { return session_; }
     void sessionChanged(bool undoable = true);
-    bool saveSession(bool saveAs);
+    bool saveSession(bool saveAs, std::function<void()> then = {});   // `then` runs once it is saved
+    void closeSession();
+    void selectedRowsChanged(int lastRow) override;
     void openSession();
     void newSession();
     bool loadSessionFile(const juce::File& f);
@@ -220,6 +225,38 @@ private:
     std::unique_ptr<juce::DocumentWindow> textViewWindow_;
     juce::Component::SafePointer<SegmentListPanel> textViewPanel_;
     void runAnalogBlack();
+    // ---- 0.15: recent sessions, track selection, repairs, take checks ----
+    RecentSessions recent_;
+    void noteRecent(const juce::File& f);
+    void openRecent(int index);
+    void endTake();                                   // stops a recording, print or capture and keeps it
+    void withLaneCheck(std::function<void()> go);     // warns first when a lane is muted, soloed or flat
+    juce::Colour playColour_;
+    int playLook_ = -1;
+    int trackAnchor_ = -1;
+    bool syncingTracks_ = false;
+    void setSelectedTracks(juce::Array<int> tracks, bool updateList);
+    void trackClicked(int track, juce::ModifierKeys mods);
+    void showTrackMenu(int track);
+    void showMarkerMenu(int markerId);
+    void exportTracks(juce::Array<int> tracks);
+    juce::Array<int> selectedTracks() const;
+    int rowOfTrack(int track) const;
+    std::unique_ptr<juce::DocumentWindow> repairWindow_;
+    juce::Component::SafePointer<RepairPanel> repairPanel_;
+    int repairRegion_ = 0;
+    struct RepairItem { RepairSpot spot; bool ticked = true, repaired = false; };
+    juce::Array<RepairItem> repairItems_;
+    juce::String takeReport_, repairStatus_;
+    void showRepair();
+    void refreshRepair();
+    bool repairSpan(const Region& r, juce::int64& a, juce::int64& b, bool wholeWhenNoInOut) const;
+    void repairInOut(int mode);
+    void removeRepairsInOut();
+    void repairFind(bool faults);
+    void repairTicked();
+    void setHearRepair(int mode);
+    void checkTake(int regionId, juce::int64 lostSamples, int lostEvents, int dropouts);
     std::unique_ptr<juce::DocumentWindow> markInfoWindow_;
     juce::Component::SafePointer<MarkInfoPanel> markInfoPanel_;
     void crossfadeNewEdits(const juce::Array<int>& ids, Session& s);   // default crossfade on new splices

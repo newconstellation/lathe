@@ -55,6 +55,7 @@ private:
     juce::Array<GainNode> gain_;   // timeline gain (empty = none)
     juce::Array<int> laneFormats_;  // per region in regions_
     juce::Array<int> anchors_, bus_;   // bus_: per region, -1 = the main mix
+    int patchMode_ = 0;
     int busCount_ = 0;
     int channels_ = 2;
     juce::AudioBuffer<double> mix_;

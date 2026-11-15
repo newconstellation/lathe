@@ -6,6 +6,7 @@
 #include "../app/Source/Metering.h"
 #include "../app/Source/SegmentList.h"
 #include "../app/Source/TimecodeStrip.h"
+#include "../app/Source/RepairPanel.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -160,6 +161,60 @@ int main() {
             snap(live, "live-take");
             live.clearLiveTake();
             CHECK(!live.liveTake().active);
+        }
+        // Lane buttons, a selected track, a selected marker, repair marks and found spots.
+        {
+            Session v = s;
+            v.lanes = 3;
+            v.addMarker(Marker::TrackStart, 2.0);
+            v.addMarker(Marker::TrackStart, 6.0);
+            const int mid = v.addMarker(Marker::TrackStart, 10.0);
+            v.lanesMuted = {1};
+            v.lanesGainOff = {2};
+            v.lanesGainShown = {0};
+            for (auto& r : v.regions)
+                if (r.id == C) { r.lane = 2; r.patches.add({r.srcIn + 44100, 12, "x.wav", 0}); }
+            Timeline tv(v, pool);
+            tv.setSize(1200, 420);
+            tv.zoomToFit();
+            for (int l = 0; l < 3; ++l) {
+                CHECK(!tv.laneButton(l, 0).isEmpty());
+                CHECK(!tv.laneButton(l, 0).intersects(tv.laneButton(l, 1)) && !tv.laneButton(l, 1).intersects(tv.laneButton(l, 2)));
+            }
+            CHECK(!tv.laneButton(0, 0).intersects(tv.laneButton(1, 0)));
+            tv.setSelectedTracks({1});
+            CHECK(tv.selectedTracks() == juce::Array<int>{1});
+            tv.selectMarker(mid);
+            juce::Array<Timeline::Spot> spots;
+            spots.add({3.2, 0, true});
+            spots.add({4.1, 0, false});
+            tv.setSpots(spots);
+            snap(tv, "lanes-tracks-spots");
+            CHECK(v.laneAudible(0) && !v.laneAudible(1) && v.laneAudible(2));
+            v.lanesSolo = {1};
+            CHECK(!v.laneAudible(0) && v.laneAudible(1));
+        }
+        // The Repair window: its list keeps ticks, counts them, and closes cleanly.
+        {
+            RepairPanel rp;
+            rp.setRegionName("Album Capture 2026-11-12 101500");
+            juce::Array<RepairPanel::Row> rows;
+            rows.add({"03:12:41", "repeated audio (65536 samples back)", "12 samples", true, true, false});
+            rows.add({"07:40:02", "click", "3 samples", false, true, false});
+            rows.add({"11:05:60", "click", "1.4 ms", false, false, false});
+            rows.add({"12:00:10", "click", "5 samples", false, true, true});
+            rp.setRows(rows);
+            rp.setStatus("!This take has 1 fault. Click one to hear it.");
+            int ticks = 0, hears = -1;
+            rp.onTick = [&](int, bool) { ++ticks; };
+            rp.onHearMode = [&](int m) { hears = m; };
+            CHECK(rp.rows().size() == 4 && rp.mode() == 0 && rp.hearMode() == 0);
+            CHECK(rp.sensitivity() > 0.0 && rp.sensitivity() < 1.0 && rp.maxClickMs() >= 0.2);
+            rp.setHearMode(2);
+            CHECK(rp.hearMode() == 2 && hears == -1);
+            snap(rp, "repair-panel");
+            rp.setSize(520, 480);
+            snap(rp, "repair-panel-small");
         }
         Session empty;
         Timeline te(empty, pool);

@@ -7,6 +7,7 @@
 #include "../app/Source/Exporter.h"
 #include "../app/Source/Paperwork.h"
 #include "../app/Source/Restore.h"
+#include "../app/Source/Repair.h"
 #include "../core/util/FlacTags.h"
 
 #include <cstdio>
@@ -1877,6 +1878,203 @@ int main() {
                 CHECK(std::abs(x.getSample(c, 100) - want) < 1e-4f);
             }
         }
+    }
+    // ---- Repairs: a recording fault is found, patched without touching the file, and exported ----
+    {
+        const double rate = 96000;
+        const int n = int(rate * 4), p = 250000;
+        auto music = [rate](int i, int ch) {
+            const double t = i / rate, tau = 2 * juce::MathConstants<double>::pi;
+            return float((0.5 + 0.2 * std::sin(tau * 0.7 * t)) * (0.2 * std::sin(tau * 196.0 * t + ch) + 0.12 * std::sin(tau * 587.0 * t) + 0.06 * std::sin(tau * 2093.0 * t + 0.3)));
+        };
+        juce::AudioBuffer<float> clean(2, n);
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < n; ++i) clean.setSample(ch, i, music(i, ch));
+        juce::AudioBuffer<float> bad(clean);
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < 12; ++i) bad.setSample(ch, p + i, clean.getSample(ch, p + i - 65536));   // 12 samples from 65,536 earlier
+        auto f = dir.getChildFile("fault.wav");
+        {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(f.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), rate, 2, 32, {}, 0));
+            os.release();
+            w->writeFromAudioSampleBuffer(bad, 0, n);
+        }
+        const auto sizeBefore = f.getSize();
+        const auto stampBefore = f.getLastModificationTime();
+        Session s;
+        s.append(s.makeRegion(f, rate, n), 0.0);
+        auto& reg = s.regions.getReference(0);
+        auto folder = dir.getChildFile("fault Processed");
+        // The check after a take finds it, exactly.
+        auto spots = scanTake(fm, reg, reg.srcIn, reg.srcOut, {});
+        juce::Array<RepairSpot> certain;
+        for (auto& sp : spots)
+            if (sp.certain) certain.add(sp);
+        CHECK(certain.size() == 1);
+        if (certain.size() == 1) {
+            std::printf("take check: %s at %lld, %lld samples\n", certain[0].kind.toRawUTF8(), (long long) certain[0].pos, (long long) certain[0].length);
+            CHECK(certain[0].pos == p && certain[0].length == 12);
+            CHECK(certain[0].kind.contains("65536"));
+        }
+        auto res = repairSpots(fm, reg, certain, folder, {});
+        CHECK(res.ok && res.patches.size() == 1);
+        reg.patches.addArray(res.patches);
+        CHECK(f.getSize() == sizeBefore && f.getLastModificationTime() == stampBefore);   // the recording itself is untouched
+        // The export carries the repair, whatever is being auditioned at the time.
+        Exporter ex(engine);
+        ExportSettings es;
+        es.runPlugins = false;
+        auto errorOf = [&](const juce::File& out, int from, int count, const juce::AudioBuffer<float>& want) {
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(out));
+            if (!r) return 1.0;
+            juce::AudioBuffer<float> x(2, count);
+            r->read(&x, 0, count, from + 2 * 96000, true, true);   // (the region starts 2 s in)
+            double worst = 0;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < count; ++i) worst = std::max(worst, double(std::abs(x.getSample(ch, i) - want.getSample(ch, from + i))));
+            return worst;
+        };
+        for (int mode : {0, 1, 2}) {
+            s.patchMode = mode;
+            auto out = dir.getChildFile("fault-fixed-" + juce::String(mode) + ".wav");
+            CHECK(ex.exportProgramWav(s, out, 32, es, [](double) { return true; }).isEmpty());
+            const double inside = errorOf(out, p - 4, 20, clean), before = errorOf(out, p - 5000, 4000, clean), after = errorOf(out, p + 1000, 4000, clean);
+            if (mode == 0) std::printf("repair in the export: worst error %.1f dB inside, %.1f dB outside\n", 20 * std::log10(inside + 1e-12), 20 * std::log10(std::max(before, after) + 1e-12));
+            CHECK(inside < 0.003);                     // against a fault that was about 0.3 high
+            CHECK(before < 1e-6 && after < 1e-6);      // nothing else moves
+        }
+        s.patchMode = 0;
+        // Hear original / hear what was removed, as the engine plays them.
+        {
+            PatchSet ps(fm, reg, reg.srcIn, reg.srcOut);
+            CHECK(!ps.empty());
+            juce::AudioBuffer<float> blk(2, 64);
+            for (int ch = 0; ch < 2; ++ch) blk.copyFrom(ch, 0, bad, ch, p - 20, 64);
+            ps.apply(blk.getArrayOfWritePointers(), 2, p - 20, 64, 2);
+            CHECK(blk.getMagnitude(0, 0, 16) == 0.0f && blk.getMagnitude(0, 40, 24) == 0.0f);   // silence where nothing was repaired
+            CHECK(blk.getMagnitude(0, 20, 12) > 0.01f);                                          // the fault alone
+        }
+        // Saved with the session, and taken off again by range.
+        auto sf = dir.getChildFile("fault.lathe");
+        juce::String err;
+        s.lanes = 3;
+        s.lanesMuted = {1};
+        s.lanesSolo = {2};
+        s.lanesGainOff = {0};
+        CHECK(s.save(sf, err));
+        Session back;
+        CHECK(back.load(sf, err));
+        CHECK(back.regions.size() == 1 && back.regions[0].patches.size() == 1);
+        if (back.regions.size() == 1 && back.regions[0].patches.size() == 1) {
+            CHECK(back.regions[0].patches[0].pos == reg.patches[0].pos && back.regions[0].patches[0].length == reg.patches[0].length);
+            CHECK(juce::File(back.regions[0].patches[0].file).existsAsFile() || folder.getChildFile(back.regions[0].patches[0].file).existsAsFile());
+        }
+        CHECK(back.lanesMuted == juce::Array<int>{1} && back.lanesSolo == juce::Array<int>{2} && back.lanesGainOff == juce::Array<int>{0});
+        CHECK(removePatches(reg, p + 100, p + 200) == 0);
+        CHECK(removePatches(reg, p - 10, p + 30) == 1 && reg.patches.isEmpty());
+        // Repair In-Out on a click the user marked.
+        juce::AudioBuffer<float> clicked(clean);
+        clicked.setSample(0, 120000, 0.9f);
+        clicked.setSample(1, 120001, -0.8f);
+        auto cf = dir.getChildFile("click.wav");
+        {
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(cf.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), rate, 2, 32, {}, 0));
+            os.release();
+            w->writeFromAudioSampleBuffer(clicked, 0, n);
+        }
+        Session cs;
+        cs.append(cs.makeRegion(cf, rate, n), 0.0);
+        auto& cr = cs.regions.getReference(0);
+        auto found = findClicks(fm, cr, cr.srcIn, cr.srcOut, 0.5, 2.0, {});
+        CHECK(found.size() >= 1 && found.size() <= 2);
+        if (!found.isEmpty()) CHECK(std::abs(found[0].pos - 120000) <= 4);
+        auto rr = repairRange(fm, cr, 119998, 120004, RepairMode::Interpolate, folder);
+        CHECK(rr.ok && rr.patches.size() == 1);
+        cr.patches.addArray(rr.patches);
+        dsp::Channels got;
+        CHECK(readPatched(fm, cr, 119990, 24, got));
+        if (got.size() == 2 && got[0].size() == 24) {
+            double worst = 0;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 24; ++i) worst = std::max(worst, double(std::abs(got[size_t(ch)][size_t(i)] - clean.getSample(ch, 119990 + i))));
+            CHECK(worst < 0.003);
+        }
+        CHECK(!repairRange(fm, cr, 1000, 1000 + dsp::kMaxInterpolate + 10, RepairMode::Interpolate, folder).ok);   // too long to invent
+    }
+
+    // ---- Quitting after auditioning a side break (this crashed 0.14 on quit) ----
+    {
+        auto a = noiseFile(dir, "brk.wav", 48000, 4.0, 5);
+        Session bs;
+        std::unique_ptr<juce::AudioFormatReader> rd(fm.createReaderFor(a));
+        bs.append(bs.makeRegion(a, rd->sampleRate, rd->lengthInSamples), 2.0);
+        auto e2 = std::make_unique<AudioEngine>();
+        e2->devices().closeAudioDevice();
+        BreakPlan plan;
+        plan.a0 = 2.0; plan.a1 = 3.0; plan.gap = 0.5; plan.b0 = 3.0; plan.b1 = 4.0;
+        e2->startBreakAudition(bs, plan);
+        e2.reset();
+        CHECK(true);
+    }
+
+    // ---- Lanes: mute, solo and gain-off are what plays, so they are what is exported ----
+    {
+        auto a = noiseFile(dir, "laneA.wav", 48000, 3.0, 21), b = noiseFile(dir, "laneB.wav", 48000, 3.0, 22);
+        Session s;
+        s.lanes = 2;
+        auto ra = s.makeRegion(a, 48000, 48000 * 3), rb = s.makeRegion(b, 48000, 48000 * 3);
+        ra.lane = 0;
+        rb.lane = 1;
+        rb.gainDb = -6.0;
+        s.regions.add(ra);
+        s.regions.add(rb);
+        Exporter ex(engine);
+        ExportSettings es;
+        es.runPlugins = false;
+        auto render = [&](const juce::String& name) {
+            auto out = dir.getChildFile(name);
+            CHECK(ex.exportProgramWav(s, out, 32, es, [](double) { return true; }).isEmpty());
+            juce::AudioBuffer<float> x(2, 48000);
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(out));
+            if (r) r->read(&x, 0, 48000, 48000, true, true); else x.clear();
+            return x;
+        };
+        auto fileSlice = [&](const juce::File& f) {
+            juce::AudioBuffer<float> x(2, 48000);
+            std::unique_ptr<juce::AudioFormatReader> r(fm.createReaderFor(f));
+            r->read(&x, 0, 48000, 48000, true, true);
+            return x;
+        };
+        auto diff = [](const juce::AudioBuffer<float>& x, const juce::AudioBuffer<float>& y, float gy) {
+            double worst = 0;
+            for (int i = 0; i < x.getNumSamples(); ++i) worst = std::max(worst, double(std::abs(x.getSample(0, i) - gy * y.getSample(0, i))));
+            return worst;
+        };
+        const auto A = fileSlice(a), B = fileSlice(b);
+        const float half = juce::Decibels::decibelsToGain(-6.0f);
+        CHECK(s.laneStateWarning().isEmpty());
+        s.lanesMuted = {1};
+        CHECK(s.laneStateWarning().contains("lane 2") && s.laneStateWarning().contains("muted"));
+        CHECK(diff(render("lane-mute.wav"), A, 1.0f) < 1e-5);          // only lane 1
+        s.lanesMuted.clear();
+        s.lanesSolo = {1};
+        CHECK(s.laneStateWarning().contains("solo"));
+        CHECK(diff(render("lane-solo.wav"), B, half) < 1e-5);          // only lane 2, at its -6 dB
+        s.lanesGainOff = {1};
+        CHECK(s.laneStateWarning().contains("gain"));
+        CHECK(diff(render("lane-flat.wav"), B, 1.0f) < 1e-5);          // its gain switched off: flat
+        s.lanesSolo.clear();
+        s.lanesGainOff.clear();
+        // Inserting a lane moves audio and lane states down; only an empty lane can go.
+        s.lanesMuted = {1};
+        s.insertLane(1);
+        CHECK(s.lanes == 3 && s.regions[1].lane == 2 && s.lanesMuted == juce::Array<int>{2});
+        CHECK(!s.deleteLane(0) && !s.deleteLane(2));
+        CHECK(s.deleteLane(1) && s.lanes == 2 && s.regions[1].lane == 1 && s.lanesMuted == juce::Array<int>{1});
     }
     dir.deleteRecursively();
     std::printf("%d checks, %d failures\n", checks, failures);

@@ -1,5 +1,7 @@
 #include "ProgramRenderer.h"
 
+#include "Repair.h"
+
 #include <CDSPResampler.h>
 
 namespace lathe {
@@ -10,10 +12,11 @@ namespace lathe {
 class ClipStream {
 public:
     ClipStream(juce::AudioFormatManager& fm, const Region& c, const EffectiveFades& fades, double targetRate, juce::int64 localStart,
-               RegionFxBank* fx, int laneFormat)
-        : clip_(c), fades_(fades), rate_(targetRate), local_(localStart), format_(laneFormat) {
+               RegionFxBank* fx, int laneFormat, int patchMode)
+        : clip_(c), fades_(fades), rate_(targetRate), local_(localStart), format_(laneFormat), patchMode_(patchMode) {
         reader_.reset(fm.createReaderFor(c.file));
         if (!reader_) return;
+        if (!c.patches.isEmpty() && patchMode != 1) patches_ = std::make_unique<PatchSet>(fm, c, c.srcIn, c.srcOut);
         fileCh_ = juce::jlimit(1, kMaxCh, int(reader_->numChannels));
         nCh_ = format_ == 1 ? 1 : format_ == 6 ? (fileCh_ >= 6 ? 6 : 2) : 2;
         if (fx && fx->hasEffects(c.id) && nCh_ == 2) {   // region effects are stereo
@@ -77,6 +80,8 @@ private:
         in_.clear();
         if (!pastEnd) {
             reader_->read(in_.getArrayOfWritePointers(), fileCh_, srcPos_, n);
+            if (patches_) patches_->apply(in_.getArrayOfWritePointers(), fileCh_, srcPos_, n, patchMode_);   // repairs
+            else if (patchMode_ == 2) in_.clear();   // "what was removed": nothing, where nothing was repaired
             if (fileCh_ == 1) in_.copyFrom(1, 0, in_, 0, 0, n);
             if (nCh_ == 1 && fileCh_ >= 2) {   // a stereo file on a mono lane: average the pair
                 in_.addFrom(0, 0, in_, 1, 0, n);
@@ -111,6 +116,8 @@ private:
 
     Region clip_;
     EffectiveFades fades_;
+    std::unique_ptr<PatchSet> patches_;
+    int patchMode_ = 0;
     double rate_, ratio_ = 1.0, gain_ = 1.0;
     int format_ = 2, fileCh_ = 2, nCh_ = 2;
     std::unique_ptr<juce::AudioFormatReader> reader_;
@@ -134,9 +141,15 @@ void ProgramRenderer::setSession(const Session& s, double targetRate, bool offli
     if (fx_) fx_->prepare(targetRate, 2048, offline);
     regions_.clear();
     fades_.clear();
+    patchMode_ = offline ? 0 : s.patchMode;   // exports always carry the repairs
     for (int i = 0; i < s.regions.size(); ++i) {
-        if (s.regions.getReference(i).mute) continue;
-        regions_.add(s.regions.getReference(i));
+        const auto& r = s.regions.getReference(i);
+        if (r.mute || !s.laneAudible(r.lane)) continue;   // what you hear is what is rendered
+        regions_.add(r);
+        if (s.lanesGainOff.contains(r.lane)) {            // the lane plays flat
+            regions_.getReference(regions_.size() - 1).envelope.clear();
+            regions_.getReference(regions_.size() - 1).gainDb = 0.0;
+        }
         fades_.add(s.fadesFor(i));
     }
     rate_ = targetRate;
@@ -189,7 +202,7 @@ bool ProgramRenderer::renderT(juce::AudioBuffer<T>& out, int start, int n) {
         juce::int64 from = juce::jmax(a, starts_[i]);
         if (!st) {
             st = std::make_unique<ClipStream>(formats_, regions_.getReference(i), fades_.getReference(i), rate_, from - starts_[i], fx_,
-                                              laneFormats_[i]);
+                                              laneFormats_[i], patchMode_);
             if (!st->ok()) {
                 error_ = "Couldn't open " + regions_.getReference(i).file.getFullPathName();
                 ok = false;

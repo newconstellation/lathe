@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.22)
 # Must come before project(): CMake fixes the deployment target when the project starts.
 # 10.15 is the floor because the DDP code uses std::filesystem.
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS")
-project(Lathe VERSION 0.14.0 LANGUAGES C CXX)
+project(Lathe VERSION 0.15.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -69,7 +69,7 @@ target_sources(Lathe PRIVATE
     app/Source/Main.cpp
     app/Source/MainComponent.cpp
     app/Source/Session.cpp
-    app/Source/ProgramRenderer.cpp
+    app/Source/ProgramRenderer.cpp app/Source/Repair.cpp
     app/Source/AudioEngine.cpp
     app/Source/PluginChain.cpp
     app/Source/PluginScan.cpp
@@ -90,6 +90,7 @@ target_sources(Lathe PRIVATE
     app/Source/DdpPlayer.cpp
     app/Source/ControlSurface.cpp
     app/Source/Restore.cpp
+    app/Source/RepairPanel.cpp
     app/Source/Products.cpp
     app/Source/Paperwork.cpp
     app/Source/DeliveryPanels.cpp
@@ -142,7 +143,7 @@ target_link_libraries(Lathe PRIVATE
 
 if(LATHE_BUILD_TESTS)
     juce_add_console_app(lathe_render_tests PRODUCT_NAME "lathe_render_tests")
-    target_sources(lathe_render_tests PRIVATE tests/render_tests.cpp app/Source/AutoMarks.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp app/Source/Products.cpp app/Source/NullTest.cpp app/Source/Commands.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp app/Source/PluginScan.cpp app/Source/Capture.cpp)
+    target_sources(lathe_render_tests PRIVATE tests/render_tests.cpp app/Source/AutoMarks.cpp app/Source/ProgramRenderer.cpp app/Source/Repair.cpp app/Source/Session.cpp app/Source/Products.cpp app/Source/NullTest.cpp app/Source/Commands.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp app/Source/PluginScan.cpp app/Source/Capture.cpp)
     target_include_directories(lathe_render_tests PRIVATE ${r8b_SOURCE_DIR})
     target_compile_definitions(lathe_render_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1 JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0)
     target_link_libraries(lathe_render_tests PRIVATE lathe_core juce::juce_audio_formats juce::juce_gui_basics juce::juce_audio_processors
@@ -153,7 +154,7 @@ endif()
 if(LATHE_BUILD_TESTS)
     juce_add_console_app(lathe_batch_tests PRODUCT_NAME "lathe_batch_tests")
     target_sources(lathe_batch_tests PRIVATE tests/batch_tests.cpp app/Source/Exporter.cpp app/Source/AudioEngine.cpp
-        app/Source/PluginChain.cpp app/Source/PluginScan.cpp app/Source/RegionFx.cpp app/Source/ProgramRenderer.cpp app/Source/Session.cpp
+        app/Source/PluginChain.cpp app/Source/PluginScan.cpp app/Source/RegionFx.cpp app/Source/ProgramRenderer.cpp app/Source/Repair.cpp app/Source/Session.cpp
         app/Source/DdpFormat.cpp app/Source/ControlSurface.cpp app/Source/Commands.cpp app/Source/Restore.cpp
         app/Source/Products.cpp app/Source/Paperwork.cpp app/Source/Capture.cpp app/Source/ExternalGear.cpp app/Source/Encoders.cpp app/Source/Delivery.cpp)
     target_include_directories(lathe_batch_tests PRIVATE ${r8b_SOURCE_DIR})
@@ -170,9 +171,9 @@ if(LATHE_BUILD_TESTS)
     juce_add_console_app(lathe_ui_tests PRODUCT_NAME "lathe_ui_tests")
     target_sources(lathe_ui_tests PRIVATE tests/ui_tests.cpp app/Source/MarkInfo.cpp app/Source/DeliveryPanels.cpp app/Source/SegmentList.cpp
         app/Source/Session.cpp app/Source/Products.cpp app/Source/AutoMarks.cpp app/Source/Paperwork.cpp
-        app/Source/Timeline.cpp app/Source/ProgramRenderer.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp app/Source/PluginScan.cpp
+        app/Source/Timeline.cpp app/Source/ProgramRenderer.cpp app/Source/Repair.cpp app/Source/RegionFx.cpp app/Source/PluginChain.cpp app/Source/PluginScan.cpp
         app/Source/Metering.cpp app/Source/AudioEngine.cpp app/Source/ExternalGear.cpp app/Source/Capture.cpp app/Source/DdpFormat.cpp
-        app/Source/EditPanels.cpp app/Source/TimecodeStrip.cpp)
+        app/Source/EditPanels.cpp app/Source/TimecodeStrip.cpp app/Source/RepairPanel.cpp)
     target_include_directories(lathe_ui_tests PRIVATE ${r8b_SOURCE_DIR})
     target_compile_definitions(lathe_ui_tests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_USE_FLAC=1 JUCE_PLUGINHOST_VST3=0 JUCE_PLUGINHOST_AU=0 JUCE_MODAL_LOOPS_PERMITTED=1)
     target_link_libraries(lathe_ui_tests PRIVATE lathe_core juce::juce_audio_utils juce::juce_audio_formats juce::juce_gui_extra

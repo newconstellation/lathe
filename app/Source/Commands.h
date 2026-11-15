@@ -61,6 +61,9 @@ enum : juce::CommandID {
     meterBridge = 0x14a0, resetMeters,
     // Inputs and capture
     capture = 0x14c0, armInputs, renameRegion,
+    // Added in 0.15
+    closeSession = 0x10a0, exportSelectedTracks,
+    repairWindow = 0x14e0, repairInOut,
 };
 }  // namespace cmd
 

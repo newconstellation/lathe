@@ -26,6 +26,16 @@ struct GainPoint {
     double db = 0;
 };
 
+// A repair: `length` samples of the region's source file from `pos` are replaced, as it plays, by
+// the audio at `offset` in a small patch file (stereo, 32-bit float). The source is never changed.
+struct Patch {
+    juce::int64 pos = 0;
+    int length = 0;
+    juce::String file;        // full path of the patch file
+    juce::int64 offset = 0;   // first sample of this patch in it
+    bool operator==(const Patch& o) const { return pos == o.pos && length == o.length && file == o.file && offset == o.offset; }
+};
+
 struct Region {
     int id = 0;
     juce::File file;
@@ -52,6 +62,7 @@ struct Region {
     // including that insert, so it joins the master chain after it. 0 = ordinary material.
     int afterGear = 0;
     juce::Array<int> printOf;            // the regions muted in its favour (to switch back to the live gear)
+    juce::Array<Patch> patches;          // repairs, in source-file positions (later ones win where they overlap)
 
     double length() const { return double(srcOut - srcIn) / fileRate; }
     double end() const { return start + length(); }
@@ -195,6 +206,18 @@ public:
     bool gainBypass = false;
     bool lockGain = false;        // global: every gain node stays put and can't be changed
     juce::Array<int> lanesOff;    // lanes set to None: edits, pastes and ripples leave them alone
+    // What is heard, and so what is exported: muted lanes are silent; when any lane is soloed only
+    // soloed lanes play; a lane with its gain off plays flat (no gain line, no segment gain).
+    juce::Array<int> lanesMuted, lanesSolo, lanesGainOff;
+    juce::Array<int> lanesGainShown;   // lanes showing their gain line for editing (the G button)
+    bool laneAudible(int lane) const { return lanesSolo.isEmpty() ? !lanesMuted.contains(lane) : lanesSolo.contains(lane); }
+    // Something is muted, soloed or flat: one line saying what (for export warnings), or empty.
+    juce::String laneStateWarning() const;
+    // Removes an empty lane (false when it has audio or is the only one); lanes below move up.
+    bool deleteLane(int lane);
+    // Repairs: 0 = play them, 1 = play the original, 2 = play only what the repairs removed.
+    // For checking a repair by ear; never saved.
+    int patchMode = 0;
     // Lane formats: 1 = mono, 2 = stereo, 6 = 5.1 (L R C LFE Ls Rs). Missing entries are stereo.
     juce::Array<int> laneFormats;
     int laneFormat(int lane) const { return juce::isPositiveAndBelow(lane, laneFormats.size()) ? laneFormats[lane] : 2; }

@@ -186,6 +186,12 @@ public:
     int livePeakCount() const { return peakCount_; }
     float livePeak(int i) const { return juce::isPositiveAndBelow(i, peakCount_.load()) ? livePeaks_[size_t(i)] : 0.0f; }
     int livePeakSamples() const { return peakChunk_; }
+    // Health of the take being (or just) recorded. Lost audio: blocks the disk writer couldn't
+    // take (the disk fell behind), so the file is that much shorter. Dropouts: times the
+    // interface reported that the computer missed its deadline during the take.
+    juce::int64 recordLostSamples() const { return recLost_; }
+    int recordLostEvents() const { return recLostEvents_; }
+    int recordDropouts() const;
     double recordRate() const { return rate_; }
     // Round-trip latency the interface reports (output + input), in samples.
     int reportedRoundTrip() const;
@@ -399,6 +405,9 @@ private:
     std::atomic<juce::int64> capFrom_{0}, capEnd_{0}, capPost_{0};
     juce::int64 capTail_ = 0;     // audio thread: samples recorded after the range
     bool capStarted_ = false;     // audio thread: the transport has been seen playing
+    std::atomic<juce::int64> recLost_{0};
+    std::atomic<int> recLostEvents_{0}, xrunsAtStart_{0};
+    bool lastWriteFailed_ = false;   // audio thread
     std::vector<float> livePeaks_;
     std::atomic<int> peakCount_{0};
     int peakChunk_ = 441, peakFill_ = 0;   // audio thread (set before a recording starts)

@@ -60,6 +60,9 @@ static int failures = 0, checks = 0;
 #define CHECK(c) do { ++checks; if (!(c)) { ++failures; std::printf("FAIL %s:%d  %s\n", __FILE__, __LINE__, #c); } } while (0)
 #define NEAR(a, b, t) CHECK(std::abs(double(a) - double(b)) <= (t))
 
+#include "../app/Source/RecentSessions.h"
+#include "recent_cases.h"
+
 static juce::File makeTone(const juce::File& dir, const juce::String& name, double rate, double sec, double hz, float amp) {
     auto f = dir.getChildFile(name);
     f.deleteFile();
@@ -254,6 +257,13 @@ int main() {
         std::printf("bit-transparency: %d mismatches in 88200 samples\n", mismatches);
     }
 
+    // ---- File > Open Recent: order, the ten-entry limit, labels, missing files, storage.
+    {
+        auto rd = dir.getChildFile("recent");
+        rd.createDirectory();
+        recentSessionTests(rd);
+    }
+
     // ---- Null test: B = A delayed 123 samples, inverted, -0.5 dB. Must find all three.
     {
         auto fa = dir.getChildFile("na.wav");
@@ -291,6 +301,130 @@ int main() {
         // Identical files are reported bit-identical.
         auto same = nullTest(fm, fa, fa, {}, {});
         CHECK(same.ok && same.offset == 0 && same.residualPeak == 0.0);
+        CHECK(same.differences.isEmpty() && !same.differsThroughout);
+        CHECK(nr.differsThroughout && nr.differences.isEmpty());
+    }
+
+    // ---- Null test: alignment at any offset, and a list of the spots where the files differ.
+    {
+        const double rate = 96000;
+        // Three sines under a slow, irregular swell, plus a little noise so every stretch is unique.
+        auto signal = [rate](int n) {
+            juce::AudioBuffer<float> s(2, n);
+            juce::Random rnd(31);
+            const double tau = 2 * juce::MathConstants<double>::pi;
+            for (int i = 0; i < n; ++i) {
+                const double t = i / rate;
+                const double env = 0.55 + 0.25 * std::sin(tau * 0.37 * t) + 0.15 * std::sin(tau * 1.13 * t + 1.0) + 0.05 * std::sin(tau * 2.9 * t + 2.0);
+                for (int ch = 0; ch < 2; ++ch) {
+                    double v = env * (0.15 * std::sin(tau * 220.0 * t + ch) + 0.1 * std::sin(tau * 1013.0 * t) + 0.05 * std::sin(tau * 3407.0 * t + 0.5 * ch));
+                    v += 0.01 * (double(rnd.nextFloat()) - 0.5);
+                    s.setSample(ch, i, float(v));
+                }
+            }
+            return s;
+        };
+        auto writeWav = [&dir, rate](const juce::String& name, const juce::AudioBuffer<float>& b) {
+            auto f = dir.getChildFile(name);
+            f.deleteFile();
+            juce::WavAudioFormat wav;
+            std::unique_ptr<juce::OutputStream> os(f.createOutputStream().release());
+            std::unique_ptr<juce::AudioFormatWriter> w(wav.createWriterFor(os.get(), rate, 2, 32, {}, 0));
+            os.release();
+            w->writeFromAudioSampleBuffer(b, 0, b.getNumSamples());
+            return f;
+        };
+
+        // B = A delayed by 300000 samples (3.1 s): far beyond the old +/- 65536 search.
+        {
+            auto x = signal(int(rate * 8.5));
+            juce::AudioBuffer<float> y(2, x.getNumSamples() + 300000);
+            y.clear();
+            for (int ch = 0; ch < 2; ++ch) y.copyFrom(ch, 300000, x, ch, 0, x.getNumSamples());
+            auto nr = nullTest(fm, writeWav("dla.wav", x), writeWav("dlb.wav", y), {}, {});
+            std::printf("null test, long delay: offset %lld, %d differences\n", (long long) nr.offset, nr.differences.size());
+            CHECK(nr.ok);
+            CHECK(nr.offset == 300000);
+            CHECK(!nr.inverted);
+            CHECK(nr.differences.isEmpty() && nr.differenceCount == 0 && !nr.differsThroughout);
+            CHECK(nr.residualPeak == 0.0);
+            CHECK(nr.toText("a", "b").contains("None: the files agree everywhere they overlap."));
+        }
+
+        auto base = signal(int(rate * 4));
+        const int n = base.getNumSamples();
+
+        // 12 samples at p replaced by the same file's audio from 65536 samples earlier.
+        {
+            const int p = 200000;
+            juce::AudioBuffer<float> y(base);
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < 12; ++i) y.setSample(ch, p + i, base.getSample(ch, p + i - 65536));
+            auto fa = writeWav("rpa.wav", base), fb = writeWav("rpb.wav", y);
+            auto nr = nullTest(fm, fa, fb, {}, {});
+            CHECK(nr.ok && nr.offset == 0 && !nr.differsThroughout);
+            CHECK(nr.differences.size() == 1 && nr.differenceCount == 1);
+            if (nr.differences.size() == 1) {
+                const auto& d = nr.differences.getReference(0);
+                std::printf("null test, repeat: %s in %s at %lld, %lld samples\n", d.kind.toRawUTF8(), d.inFile.toRawUTF8(), (long long) d.start, (long long) d.length);
+                CHECK(d.start == p && d.length == 12);
+                CHECK(d.kind.startsWith("repeated audio"));
+                CHECK(d.kind.contains("65536"));
+                CHECK(d.inFile == "B");
+            }
+            CHECK(nr.toText("a", "b").contains("Identical except for 1 short event"));
+            auto sw = nullTest(fm, fb, fa, {}, {});
+            CHECK(sw.ok && sw.offset == 0 && sw.differences.size() == 1);
+            if (sw.differences.size() == 1) {
+                const auto& d = sw.differences.getReference(0);
+                CHECK(d.start == p && d.length == 12);
+                CHECK(d.kind.startsWith("repeated audio"));
+                CHECK(d.inFile == "A");
+            }
+        }
+
+        // B is missing 37 samples at q; later, A has a one-sample click at z. The comparison must
+        // re-align after the drop and still find the click, at A's position.
+        {
+            const int q = 150000, z = 300000, cut = 37;
+            juce::AudioBuffer<float> x(base);
+            for (int ch = 0; ch < 2; ++ch) x.setSample(ch, z, x.getSample(ch, z) + 0.5f);
+            juce::AudioBuffer<float> y(2, n - cut);
+            for (int ch = 0; ch < 2; ++ch) {
+                y.copyFrom(ch, 0, base, ch, 0, q);
+                y.copyFrom(ch, q, base, ch, q + cut, n - q - cut);
+            }
+            auto nr = nullTest(fm, writeWav("dra.wav", x), writeWav("drb.wav", y), {}, {});
+            CHECK(nr.ok && nr.offset == 0 && !nr.differsThroughout);
+            for (const auto& d : nr.differences)
+                std::printf("null test, drop + click: %s in %s at %lld, %lld samples\n", d.kind.toRawUTF8(), d.inFile.toRawUTF8(), (long long) d.start, (long long) d.length);
+            CHECK(nr.differences.size() == 2 && nr.differenceCount == 2);
+            if (nr.differences.size() == 2) {
+                const auto& d = nr.differences.getReference(0);
+                CHECK(d.kind.startsWith("dropped samples"));
+                CHECK(d.kind.contains("37"));
+                CHECK(d.inFile == "B");
+                CHECK(d.start == q);
+                const auto& c = nr.differences.getReference(1);
+                CHECK(c.kind == "click");
+                CHECK(c.inFile == "A");
+                CHECK(c.start == z && c.length == 1);
+                NEAR(c.peak, 0.5, 1e-6);
+            }
+            CHECK(nr.compared == juce::int64(n - cut));
+        }
+
+        // B = A at half the level: a broad difference, not a list of spots.
+        {
+            juce::AudioBuffer<float> y(base);
+            y.applyGain(0.5f);
+            auto nr = nullTest(fm, writeWav("gna.wav", base), writeWav("gnb.wav", y), {}, {});
+            CHECK(nr.ok && nr.offset == 0 && !nr.inverted);
+            CHECK(nr.differsThroughout);
+            CHECK(nr.differences.isEmpty());
+            NEAR(nr.gainDiffDb, 20.0 * std::log10(2.0), 0.001);
+            CHECK(nr.toText("a", "b").contains("differ throughout"));
+        }
     }
 
     // ---- Region effects: run before fades, with latency compensated exactly.

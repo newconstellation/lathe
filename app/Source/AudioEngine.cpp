@@ -65,6 +65,15 @@ AudioEngine::~AudioEngine() {
     playerTransport_.setSource(nullptr);
     playerReader_.reset();
     {
+        // (This transport outlives the sources it plays, by member order: let go of them first,
+        // or its own destructor reaches into freed memory. That was the crash on quit after
+        // auditioning a side break.)
+        const juce::ScopedLock bl(breakLock_);
+        breakTransport_.setSource(nullptr);
+        breakBuffered_.reset();
+        breakSource_.reset();
+    }
+    {
         const juce::ScopedLock dl(dryLock_);
         dryResampler_.reset();
         dryBuffered_.reset();
@@ -324,6 +333,15 @@ void AudioEngine::resetLivePeaks() {
     peakFill_ = 0;
     peakAcc_ = 0.0f;
     peakCount_ = 0;
+    recLost_ = 0;
+    recLostEvents_ = 0;
+    lastWriteFailed_ = false;
+    xrunsAtStart_ = devices_.getXRunCount();
+}
+
+int AudioEngine::recordDropouts() const {
+    const int now = devices_.getXRunCount();
+    return now >= 0 && xrunsAtStart_ >= 0 ? juce::jmax(0, now - xrunsAtStart_.load()) : 0;
 }
 
 double AudioEngine::livePosition() const {
@@ -845,8 +863,15 @@ void AudioEngine::getNextAudioBlock(const juce::AudioSourceChannelInfo& info) {
                 // A print is taken inside the chain, straight after its insert; everything else from the inputs.
                 const float* ch[6];
                 for (int c = 0; c < 6; ++c) ch[c] = print ? tapBuf_.getReadPointer(juce::jmin(c, 1)) : inBuf_.getReadPointer(c);
-                recWriter_->write(ch, n);
-                recSamples_ += n;
+                if (!recWriter_->write(ch, n)) {
+                    // The disk writer is full (the disk fell behind): this block isn't in the file.
+                    recLost_ += n;
+                    if (!lastWriteFailed_) ++recLostEvents_;
+                    lastWriteFailed_ = true;
+                } else {
+                    lastWriteFailed_ = false;
+                    recSamples_ += n;
+                }
                 // The take's level for the timeline, as it is written.
                 const int nc = print ? 2 : juce::jlimit(1, 6, recChannels_.load());
                 int count = peakCount_;

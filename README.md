@@ -228,6 +228,59 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
   - the plugin buttons sit directly under the plugin list, with a labelled "Problems & notes" box
     below.
 
+## Repairs, recording health, lane buttons, track selection, Close and Open Recent (v0.15)
+
+- **Repair** (Edit > Repair..., Cmd+Option+D). The recording itself is never changed: a repair
+  is a few samples kept in a small file beside the session and swapped in as the audio plays,
+  so it can be undone, taken off again, and compared at any time.
+  - **Repair In-Out** (Cmd+Option+I): mark the damage with In and Out and rebuild it.
+    - *Interpolate* rebuilds up to about a quarter second from the audio either side (clicks,
+      dropouts, repeated samples).
+    - *Replace from similar audio* fills a longer gap from the closest-matching audio nearby.
+    - *De-pop* takes out a low thump and leaves the music on top of it.
+  - **Find Clicks** lists every click in the In-Out (or the whole region), marked on the
+    timeline. Click one to hear it, untick anything that is really music, then **Repair
+    Ticked**.
+  - **Check for Recording Faults** looks for repeated audio and breaks.
+  - **Hear the Repair / Hear Original / Hear What Was Removed** switch while playing. Exports
+    always carry the repair, whichever is being auditioned.
+  - Repaired spots show a small green tick under the waveform. **Remove Repairs in In-Out**
+    puts the recorded audio back.
+- **Recording health.** During Record, Print and Capture, Lathe counts audio the disk failed to
+  take and dropouts the interface reports, and warns in red while it is happening. After every
+  take the file is checked for repeated audio (the mark of a buffer fault). The errors field
+  then says either "recorded cleanly, no dropouts" or what went wrong; faults are marked on the
+  timeline and listed in the Repair window.
+- **Null test** lines the two files up however far apart they start, then lists every spot
+  where they differ with its time and kind (repeated audio and how far back, dropped samples,
+  click) and which file has it. It re-aligns after dropped samples, so one fault isn't reported
+  as a difference from there to the end. If one of the files is on the timeline, the spots are
+  marked there too.
+- **M, S and G on every lane.**
+  - **M** mutes the lane. **S** solos it (Cmd-click: only this lane). Option-click M or S clears
+    them all.
+  - **G** shows that lane's gain line for editing. **Option-click G** switches the lane's gain
+    changes off (the button turns purple, "GAIN OFF").
+  - **Exports, DDP images and batch renders deliver exactly what plays**, and ask first when a
+    lane is muted, soloed or has its gain off.
+  - Right-click a lane's badge: Insert Lane Above / Below, Delete Lane (when it has no audio).
+  - Analyse (Cmd+Shift+A) flags where the lanes add up to more than full scale.
+- **Selecting tracks to export.** Click a track on the yellow track bar (Shift-click a run,
+  Cmd-click to add or remove), or select rows in the track list; the two stay in step. Then
+  Export > Each track > **Selected tracks...**, cut and tagged as on the CD.
+  - Dragging a track still reorders it, but only after it moves a few pixels.
+  - Double-click a track: In-Out to that track. Right-click: Export This Track, Play Track,
+    Set In-Out to Track, Mark Info.
+- **Marker flags** stay clearly highlighted when selected. A click goes there and selects the
+  row in the list; a double-click opens Mark Info; right-click renames, locks or deletes.
+- **File > Close Session** (Cmd+W) asks to save, stops playback and leaves an empty session.
+  Meters, plugin windows and Audio Setup stay open.
+- **File > Open Recent**: the last ten sessions, with their folder. A missing one says so and
+  can be removed.
+- **While recording, Play is a red Stop.** Play, Stop, Space and Record all end the take and
+  keep it; none of them can start playback in the middle of a take.
+- Fixed: a crash on quit after auditioning a side break.
+
 ## Stability by design
 
 - Audio is streamed from disk on a background thread; the audio callback never touches the disk.

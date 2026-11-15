@@ -78,7 +78,7 @@ CapturePlan planCapture(const Session& s, juce::Range<double> selection) {
     bool allMono = true;
     int lowest = -1;
     for (auto& r : s.regions) {
-        if (r.mute || r.end() <= p.range.getStart() || r.start >= p.range.getEnd()) continue;
+        if (r.mute || !s.laneAudible(r.lane) || r.end() <= p.range.getStart() || r.start >= p.range.getEnd()) continue;
         p.sources.add(r.id);
         lowest = juce::jmax(lowest, r.lane);
         allMono = allMono && s.laneFormat(r.lane) == 1;
@@ -153,7 +153,7 @@ juce::String renameAudioFile(Session& s, const juce::File& from, const juce::Str
 bool needsHardware(const Session& s, int lastLiveHardwareSlot, const std::function<int(int)>& slotOfAnchor) {
     if (lastLiveHardwareSlot < 0 || s.programmeChannels() == 6) return false;
     for (auto& r : s.regions) {
-        if (r.mute) continue;
+        if (r.mute || !s.laneAudible(r.lane)) continue;
         const int enters = r.afterGear != 0 ? slotOfAnchor(r.afterGear) : -1;   // joins after this slot
         if (enters < lastLiveHardwareSlot) return true;
     }

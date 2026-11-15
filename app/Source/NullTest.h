@@ -22,6 +22,23 @@ struct NullResult {
     double signalRms = 0;
     double gainDiffDb = 0;           // gain that best matches B to A
     double residualRmsGainMatched = 0;
+
+    // Spots where the files differ, in A's sample positions after alignment. Listed only when the
+    // files otherwise agree (to within about -100 dBFS); when they differ broadly everywhere,
+    // differsThroughout is set and the list stays empty.
+    struct Difference {
+        juce::int64 start = 0;
+        juce::int64 length = 0;
+        double peak = 0;             // largest |A - B| in the event, linear
+        juce::String kind;           // "repeated audio (N samples back)", "dropped samples (N samples)", "click" or "differs"
+        juce::String inFile;         // "A", "B" or "?"
+    };
+    static constexpr int maxListedDifferences = 200;
+    juce::Array<Difference> differences;   // capped at maxListedDifferences
+    juce::int64 differenceCount = 0;       // total found (may exceed the cap)
+    bool differsThroughout = false;
+    double residualPeakOutside = 0;        // largest |A - B| outside the listed events, linear
+
     juce::String toText(const juce::String& nameA, const juce::String& nameB) const;
 };
 

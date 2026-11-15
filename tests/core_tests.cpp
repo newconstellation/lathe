@@ -6,7 +6,6 @@
 #include "../core/dsp/Meters.h"
 #include "../core/dsp/Scope.h"
 #include "../core/dsp/Restoration.h"
-#include "../core/dsp/Restoration.h"
 #include "../core/util/Hash.h"
 #include "../core/doc/Pdf.h"
 
@@ -430,6 +429,151 @@ static void testRestoration() {
         auto st2 = dsp::declick(c2, fs, 6, 1.0);
         CHECK(st2.found <= 2);
         CHECK(rmsDiff(c2[0], clean, 0, size_t(n)) < 1e-4);
+    }
+
+    // Repair of a marked gap by interpolation: short gaps come back almost exactly.
+    {
+        const double fr = 96000;
+        const int m = int(fr * 3);
+        auto clean = music(m, fr, 5);
+        auto errDb = [&](const dsp::Channels& c, size_t g0, size_t g1) {
+            return 20 * std::log10(rmsDiff(c[0], clean, g0, g1) / (rmsDiff(clean, std::vector<double>(clean.size(), 0.0), g0, g1) + 1e-15) + 1e-15);
+        };
+        for (int len : {12, 96, 480, 1920}) {   // 0.125 ms .. 20 ms
+            dsp::Channels ch{clean, clean};
+            const size_t g0 = size_t(m / 2 + 1234), g1 = g0 + size_t(len);
+            for (size_t i = g0; i < g1; ++i) { ch[0][i] = 0.7; ch[1][i] = -0.7; }
+            CHECK(dsp::interpolateGap(ch, int64_t(g0), int64_t(g1)));
+            const double e = errDb(ch, g0, g1);
+            std::printf("interpolate %4d samples at 96 kHz: error %.1f dB below the music\n", len, -e);
+            CHECK(e < (len <= 96 ? -40.0 : len <= 480 ? -20.0 : -6.0));
+            // Nothing outside the gap is touched, and both channels are rebuilt.
+            CHECK(rmsDiff(ch[0], clean, 0, g0) == 0.0 && rmsDiff(ch[0], clean, g1, size_t(m)) == 0.0);
+            CHECK(rmsDiff(ch[1], clean, g0, g1) < rmsDiff(clean, std::vector<double>(clean.size(), 0.0), g0, g1));
+        }
+        dsp::Channels ch{clean, clean};
+        CHECK(!dsp::interpolateGap(ch, 5, 20));                                   // no context before it
+        CHECK(!dsp::interpolateGap(ch, 1000, 1000 + dsp::kMaxInterpolate + 1));   // too long
+        CHECK(ch[0] == clean);
+    }
+
+    // A recording fault: a few samples of old audio played again. Found, exactly, and repaired.
+    {
+        const double fr = 96000;
+        const int m = int(fr * 3);
+        auto l = music(m, fr, 6), r = music(m, fr, 7);
+        dsp::Channels clean{l, r};
+        std::vector<dsp::Glitch> none;
+        dsp::scanGlitches(clean, 0, size_t(m), 0, none);
+        std::printf("glitch scan of clean music: %d found\n", int(none.size()));
+        CHECK(none.empty());
+        dsp::Channels ch = clean;
+        const size_t at = 200000;
+        for (size_t i = 0; i < 12; ++i)
+            for (auto& x : ch) x[at + i] = x[at + i - 65536];
+        std::vector<dsp::Glitch> found;
+        dsp::scanGlitches(ch, 0, size_t(m), 1000, found);
+        CHECK(found.size() == 1);
+        if (found.size() == 1) {
+            std::printf("repeat found at %lld, %lld samples, lag %lld\n", (long long)found[0].start - 1000, (long long)found[0].length, (long long)found[0].lag);
+            CHECK(found[0].start == 1000 + int64_t(at) && found[0].length == 12 && found[0].lag == 65536);
+            CHECK(dsp::interpolateGap(ch, int64_t(at), int64_t(at) + 12));
+            CHECK(rmsDiff(ch[0], l, at, at + 12) < 0.003);
+        }
+        // Scanned in pieces with history, as a long file is: the same answer, once.
+        std::vector<dsp::Glitch> pieces;
+        for (size_t p0 = 0; p0 < size_t(m); p0 += 50000) {
+            const size_t h = std::min<size_t>(p0, size_t(1) << 18), p1 = std::min(size_t(m), p0 + 50000);
+            dsp::Channels w(2);
+            for (int c = 0; c < 2; ++c) w[size_t(c)].assign(ch.size() ? clean[size_t(c)].begin() + long(p0 - h) : clean[size_t(c)].begin(), clean[size_t(c)].begin() + long(p1));
+            for (size_t i = 0; i < 12; ++i)
+                for (int c = 0; c < 2; ++c)
+                    if (at + i >= p0 - h && at + i < p1) w[size_t(c)][at + i - (p0 - h)] = clean[size_t(c)][at + i - 65536];
+            dsp::scanGlitches(w, h, h + (p1 - p0), int64_t(p0) - int64_t(h), pieces);
+        }
+        CHECK(pieces.size() == 1 && pieces[0].start == int64_t(at) && pieces[0].lag == 65536);
+        // A plain break (lost samples): reported as a break, not a repeat.
+        dsp::Channels cut = clean;
+        for (auto& x : cut) x.erase(x.begin() + 150000, x.begin() + 150000 + 4000);
+        std::vector<dsp::Glitch> breaks;
+        dsp::scanGlitches(cut, 0, cut[0].size(), 0, breaks);
+        std::printf("break scan: %d found%s\n", int(breaks.size()), breaks.empty() ? "" : (", first at " + std::to_string(breaks[0].start)).c_str());
+        CHECK(breaks.size() <= 1);
+        if (!breaks.empty()) CHECK(std::abs(breaks[0].start - 150000) <= 2 && breaks[0].lag == 0);
+    }
+
+    // Thump: a low-frequency bump is taken out; everything above it is left alone.
+    {
+        const double fr = 48000;
+        const int m = int(fr * 3);
+        auto clean = music(m, fr, 8);
+        dsp::Channels ch{clean, clean};
+        const size_t g0 = size_t(m / 2), len = size_t(fr * 0.02);
+        for (size_t i = 0; i < len; ++i) {
+            const double bump = 0.5 * std::sin(3.14159265358979 * double(i) / double(len));
+            ch[0][g0 + i] += bump;
+            ch[1][g0 + i] += bump;
+        }
+        const size_t w0 = g0 - size_t(fr * 0.05), w1 = g0 + len + size_t(fr * 0.05);
+        const double before = rmsDiff(ch[0], clean, w0, w1);
+        CHECK(dsp::dethump(ch, fr, int64_t(g0), int64_t(g0 + len)));
+        const double after = rmsDiff(ch[0], clean, w0, w1);
+        std::printf("dethump: error %.1f dB -> %.1f dB\n", 20 * std::log10(before), 20 * std::log10(after + 1e-15));
+        CHECK(20 * std::log10(after / before) < -12);
+        CHECK(rmsDiff(ch[0], clean, 0, g0 - size_t(fr * 0.1)) == 0.0);
+    }
+
+    // Replacement from similar audio: a repeating figure with 60 ms destroyed.
+    {
+        const double fr = 48000;
+        const int period = int(fr * 0.5), m = period * 6;
+        auto one = music(period, fr, 9);
+        std::vector<double> clean(static_cast<size_t>(m));
+        for (int i = 0; i < m; ++i) {
+            // (a short blend at each repeat so the figure loops without a step)
+            const int k = i % period;
+            const double w = k < 480 ? k / 480.0 : 1.0;
+            clean[size_t(i)] = one[size_t(k)] * w + (k < 480 ? one[size_t(std::min(period - 1, period - 480 + k))] * 0 : 0.0);
+        }
+        dsp::Channels ch{clean, clean};
+        const size_t g0 = size_t(period * 3 + 7000), len = size_t(fr * 0.06);
+        for (size_t i = 0; i < len; ++i) { ch[0][g0 + i] = 0; ch[1][g0 + i] = 0; }
+        double score = 0;
+        CHECK(dsp::patchFromSimilar(ch, fr, int64_t(g0), int64_t(g0 + len), &score));
+        const double sig = rmsDiff(clean, std::vector<double>(clean.size(), 0.0), g0, g0 + len);
+        std::printf("patch from similar audio: match %.3f, error %.1f dB below the music\n", score, -20 * std::log10(rmsDiff(ch[0], clean, g0, g0 + len) / sig + 1e-15));
+        CHECK(score > 0.95 && rmsDiff(ch[0], clean, g0, g0 + len) < sig * 0.05);
+        // Noise has nothing like itself nearby: refused, untouched.
+        std::srand(5);
+        std::vector<double> noise(static_cast<size_t>(m));
+        for (auto& v : noise) v = (std::rand() % 2001 - 1000) / 1000.0;
+        dsp::Channels nz{noise, noise};
+        CHECK(!dsp::patchFromSimilar(nz, fr, int64_t(g0), int64_t(g0 + len), &score));
+        CHECK(nz[0] == noise);
+    }
+
+    // Finding clicks without changing anything, then repairing only the chosen ones.
+    {
+        auto clean = music(n, fs, 1);
+        dsp::Channels ch{clean, clean};
+        const size_t spots[3] = {30000, 80000, 130000};
+        for (size_t at : spots)
+            for (size_t k = 0; k < 5; ++k) { ch[0][at + k] += 0.5; ch[1][at + k] += 0.4; }
+        const auto before = ch;
+        auto ev = dsp::findClicks(ch, fs, 6, 1.0);
+        CHECK(ch == before);
+        int hit = 0;
+        for (auto& e : ev)
+            for (size_t at : spots) hit += e.start <= int64_t(at) && e.start + e.length >= int64_t(at + 5) ? 1 : 0;
+        std::printf("findClicks: %d events, %d of 3 planted found\n", int(ev.size()), hit);
+        CHECK(hit == 3 && ev.size() <= 5);
+        // Repair only the first.
+        std::vector<dsp::ClickEvent> first;
+        for (auto& e : ev)
+            if (e.start <= int64_t(spots[0]) && e.start + e.length >= int64_t(spots[0] + 5)) first.push_back(e);
+        CHECK(dsp::repairClicks(ch, first) == 1);
+        CHECK(rmsDiff(ch[0], clean, spots[0] - 20, spots[0] + 30) < 0.02);
+        CHECK(rmsDiff(ch[0], before[0], spots[1] - 20, spots[1] + 30) == 0.0);
     }
 
     // Denoise: white noise at -50 dBFS RMS over music; learn from a noise-only stretch.

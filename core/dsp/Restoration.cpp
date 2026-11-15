@@ -154,62 +154,190 @@ void lsarInterpolate(std::vector<double>& x, long g0, long g1, int order) {
         for (int i = 0; i < n; ++i) x[size_t(g0 + i)] = rhs[size_t(i)];
 }
 
+// Autocorrelation-method LPC from two separate stretches (the audio either side of a gap), so
+// nothing inside the gap biases the model. a[0] = 1.
+std::vector<double> lpcTwoSided(const double* left, int nl, const double* right, int nr, int order) {
+    std::vector<double> r(size_t(order + 1), 0.0);
+    for (int k = 0; k <= order; ++k) {
+        double acc = 0;
+        for (int i = k; i < nl; ++i) acc += left[i] * left[i - k];
+        for (int i = k; i < nr; ++i) acc += right[i] * right[i - k];
+        r[size_t(k)] = acc;
+    }
+    std::vector<double> a(size_t(order + 1), 0.0);
+    a[0] = 1;
+    if (r[0] <= 1e-20) return a;
+    r[0] *= 1.0 + 1e-7;
+    double err = r[0];
+    std::vector<double> prev;
+    for (int i = 1; i <= order; ++i) {
+        double acc = r[size_t(i)];
+        for (int j = 1; j < i; ++j) acc += a[size_t(j)] * r[size_t(i - j)];
+        const double k = -acc / err;
+        prev = a;
+        for (int j = 1; j < i; ++j) a[size_t(j)] = prev[size_t(j)] + k * prev[size_t(i - j)];
+        a[size_t(i)] = k;
+        err *= (1 - k * k);
+        if (err <= 1e-20 * r[0]) break;
+    }
+    return a;
+}
+
+// Least-squares AR interpolation of x[g0, g1) for gaps of any length: the normal equations are
+// banded (half-width = order), so they are solved with a banded Cholesky.
+bool lsarInterpolateBanded(std::vector<double>& x, long g0, long g1) {
+    const long N = long(x.size()), L = g1 - g0;
+    if (L <= 0 || g0 < 0 || g1 > N) return false;
+    const long avail = std::min(g0, N - g1);
+    // Short gaps need few coefficients; longer ones need enough to hold the low notes too.
+    int p = L <= 32 ? 32 : int(std::clamp<long>(4 * L, 256, 512));
+    p = int(std::min<long>(p, avail / 3));
+    if (p < 4) return false;
+    const long ctx = std::min<long>(avail, std::max<long>(long(p) * 16, 8192));
+    const auto a = lpcTwoSided(x.data() + (g0 - ctx), int(ctx), x.data() + g1, int(ctx), p);
+    // M[i][j] = sum_t a[t-u_i] a[t-u_j] over t in [g0, g1 + p): a Toeplitz band, ra[|i-j|].
+    std::vector<double> ra(size_t(p + 1), 0.0);
+    for (int d = 0; d <= p; ++d)
+        for (int k = 0; k + d <= p; ++k) ra[size_t(d)] += a[size_t(k)] * a[size_t(k + d)];
+    const int n = int(L), w = std::min(p, n - 1);
+    std::vector<double> rhs(size_t(n), 0.0);
+    for (long t = g0; t < g1 + p; ++t) {
+        double known = 0;
+        for (int k = 0; k <= p; ++k) {
+            const long s = t - k;
+            if (s < g0 || s >= g1) known += a[size_t(k)] * x[size_t(s)];
+        }
+        const long u0 = std::max(g0, t - p), u1 = std::min(g1 - 1, t);
+        for (long u = u0; u <= u1; ++u) rhs[size_t(u - g0)] -= a[size_t(t - u)] * known;
+    }
+    // Banded Cholesky, lower band: B[i][d] = L[i][i-d], d = 0..w.
+    std::vector<double> B(size_t(n) * size_t(w + 1), 0.0);
+    auto at = [&](int i, int d) -> double& { return B[size_t(i) * size_t(w + 1) + size_t(d)]; };
+    const double ridge = ra[0] * 1e-9;
+    for (int i = 0; i < n; ++i) {
+        for (int d = std::min(i, w); d >= 0; --d) {
+            const int j = i - d;
+            double sum = ra[size_t(d)] + (d == 0 ? ridge : 0.0);
+            const int k0 = std::max(0, i - w);
+            for (int k = k0; k < j; ++k) sum -= at(i, i - k) * at(j, j - k);
+            if (d == 0) {
+                if (sum <= 0) return false;
+                at(i, 0) = std::sqrt(sum);
+            } else {
+                at(i, d) = sum / at(j, 0);
+            }
+        }
+    }
+    for (int i = 0; i < n; ++i) {
+        double t = rhs[size_t(i)];
+        for (int k = std::max(0, i - w); k < i; ++k) t -= at(i, i - k) * rhs[size_t(k)];
+        rhs[size_t(i)] = t / at(i, 0);
+    }
+    for (int i = n - 1; i >= 0; --i) {
+        double t = rhs[size_t(i)];
+        for (int k = i + 1; k <= std::min(n - 1, i + w); ++k) t -= at(k, k - i) * rhs[size_t(k)];
+        rhs[size_t(i)] = t / at(i, 0);
+    }
+    for (int i = 0; i < n; ++i)
+        if (!std::isfinite(rhs[size_t(i)])) return false;
+    for (int i = 0; i < n; ++i) x[size_t(g0 + i)] = rhs[size_t(i)];
+    return true;
+}
+
+struct Gap { long g0, g1; double strength; };
+
+// One detection pass: stretches whose prediction residual stands far above the local level.
+std::vector<Gap> detectGaps(const Channels& ch, double rate, double threshold, int order) {
+    std::vector<Gap> gaps;
+    const size_t len = frames(ch);
+    if (len < size_t(order * 8)) return gaps;
+    const int block = int(std::max(2048.0, rate * 0.05));
+    // Joint detector: residual energy summed over channels.
+    std::vector<double> resid(len, 0.0);
+    for (auto& x : ch) {
+        for (size_t b0 = 0; b0 < len; b0 += size_t(block)) {
+            size_t b1 = std::min(len, b0 + size_t(block));
+            size_t w0 = b0 >= size_t(order) ? b0 - size_t(order) : 0;
+            auto a = lpc(x.data() + w0, int(b1 - w0), order);
+            for (size_t t = std::max(b0, size_t(order)); t < b1; ++t) {
+                double e = 0;
+                for (int k = 0; k <= order; ++k) e += a[size_t(k)] * x[t - size_t(k)];
+                resid[t] += e * e;
+            }
+        }
+    }
+    // Robust local scale: median of |e| per block.
+    std::vector<double> scale((len + size_t(block) - 1) / size_t(block), 0.0);
+    for (size_t b = 0; b < scale.size(); ++b) {
+        size_t b0 = b * size_t(block), b1 = std::min(len, b0 + size_t(block));
+        std::vector<double> v(resid.begin() + long(b0), resid.begin() + long(b1));
+        if (v.empty()) continue;
+        std::nth_element(v.begin(), v.begin() + long(v.size() / 2), v.end());
+        scale[b] = std::sqrt(std::max(1e-24, v[v.size() / 2]));
+    }
+    // Mark samples whose residual exceeds threshold x local scale, widen, merge.
+    long cur0 = -1, last = -1;
+    double peak = 0;
+    for (size_t t = 0; t < len; ++t) {
+        const double limit = threshold * scale[t / size_t(block)] * 1.4826;
+        const double e = std::sqrt(resid[t]);
+        if (e > limit) {
+            if (cur0 < 0) { cur0 = long(t); peak = 0; }
+            last = long(t);
+            peak = std::max(peak, e / limit);
+        } else if (cur0 >= 0 && long(t) - last > 16) {
+            // A click's tail keeps exciting the predictor a few samples after the spike:
+            // repair a little beyond the last flagged sample, and merge flags < 16 apart.
+            gaps.push_back({cur0 - 3, last + 6, peak});
+            cur0 = -1;
+        }
+    }
+    if (cur0 >= 0) gaps.push_back({cur0 - 3, last + 6, peak});
+    for (auto& g : gaps) {
+        g.g0 = std::max<long>(0, g.g0);
+        g.g1 = std::min<long>(long(len), g.g1);
+    }
+    return gaps;
+}
+
 ClickStats detectAndRepair(Channels& ch, double rate, double threshold, int maxLen, int order, int passes) {
     ClickStats st;
-    const size_t len = frames(ch);
-    if (len < size_t(order * 8)) return st;
-    const int block = int(std::max(2048.0, rate * 0.05));
     for (int pass = 0; pass < passes; ++pass) {
-        // Joint detector: residual energy summed over channels.
-        std::vector<double> resid(len, 0.0);
-        for (auto& x : ch) {
-            for (size_t b0 = 0; b0 < len; b0 += size_t(block)) {
-                size_t b1 = std::min(len, b0 + size_t(block));
-                size_t w0 = b0 >= size_t(order) ? b0 - size_t(order) : 0;
-                auto a = lpc(x.data() + w0, int(b1 - w0), order);
-                for (size_t t = std::max(b0, size_t(order)); t < b1; ++t) {
-                    double e = 0;
-                    for (int k = 0; k <= order; ++k) e += a[size_t(k)] * x[t - size_t(k)];
-                    resid[t] += e * e;
-                }
-            }
-        }
-        // Robust local scale: median of |e| over a sliding window, sampled per block.
-        std::vector<double> scale((len + size_t(block) - 1) / size_t(block), 0.0);
-        for (size_t b = 0; b < scale.size(); ++b) {
-            size_t b0 = b * size_t(block), b1 = std::min(len, b0 + size_t(block));
-            std::vector<double> v(resid.begin() + long(b0), resid.begin() + long(b1));
-            if (v.empty()) continue;
-            std::nth_element(v.begin(), v.begin() + long(v.size() / 2), v.end());
-            scale[b] = std::sqrt(std::max(1e-24, v[v.size() / 2]));
-        }
-        // Mark samples whose residual exceeds threshold x local scale, widen, merge.
-        std::vector<std::pair<long, long>> gaps;
-        long cur0 = -1, last = -1;
-        for (size_t t = 0; t < len; ++t) {
-            if (std::sqrt(resid[t]) > threshold * scale[t / size_t(block)] * 1.4826) {
-                if (cur0 < 0) cur0 = long(t);
-                last = long(t);
-            } else if (cur0 >= 0 && long(t) - last > 16) {
-                // A click's tail keeps exciting the predictor a few samples after the spike:
-                // repair a little beyond the last flagged sample, and merge flags < 16 apart.
-                gaps.push_back({cur0 - 3, last + 6});
-                cur0 = -1;
-            }
-        }
-        if (cur0 >= 0) gaps.push_back({cur0 - 3, last + 6});
         int fixedThisPass = 0;
-        for (auto& g : gaps) {
-            long g0 = std::max<long>(0, g.first), g1 = std::min<long>(long(len), g.second);
-            if (g1 - g0 > maxLen || g1 <= g0) continue;
-            for (auto& x : ch) lsarInterpolate(x, g0, g1, order);
+        for (auto& g : detectGaps(ch, rate, threshold, order)) {
+            if (g.g1 - g.g0 > maxLen || g.g1 <= g.g0) continue;
+            for (auto& x : ch) lsarInterpolate(x, g.g0, g.g1, order);
             ++fixedThisPass;
-            st.samplesRepaired += g1 - g0;
+            st.samplesRepaired += g.g1 - g.g0;
         }
         st.found += fixedThisPass;
         if (fixedThisPass == 0) break;
     }
     return st;
+}
+
+// Zero-phase low-pass: a second-order Butterworth run forwards and backwards, twice.
+std::vector<double> lowpassZeroPhase(const std::vector<double>& x, double rate, double fc) {
+    const double k = std::tan(3.14159265358979323846 * fc / rate), q = 0.70710678118654752;
+    const double norm = 1.0 / (1.0 + k / q + k * k);
+    const double b0 = k * k * norm, b1 = 2 * b0, b2 = b0, a1 = 2 * (k * k - 1) * norm, a2 = (1 - k / q + k * k) * norm;
+    std::vector<double> y(x);
+    auto run = [&](bool reverse) {
+        // Start in steady state at the first value, so the ends don't ring.
+        const long n = long(y.size());
+        if (n == 0) return;
+        const double x0 = y[size_t(reverse ? n - 1 : 0)];
+        double z1 = x0 * (1 - b0), z2 = x0 * (b2 - a2);
+        for (long i = 0; i < n; ++i) {
+            double& v = y[size_t(reverse ? n - 1 - i : i)];
+            const double in = v, out = b0 * in + z1;
+            z1 = b1 * in - a1 * out + z2;
+            z2 = b2 * in - a2 * out;
+            v = out;
+        }
+    };
+    for (int pass = 0; pass < 2; ++pass) { run(false); run(true); }
+    return y;
 }
 }  // namespace
 
@@ -300,6 +428,211 @@ ClickStats declick(Channels& ch, double rate, double sensitivity, double maxClic
     int maxLen = int(std::clamp(maxClickMs, 0.1, 5.0) * rate / 1000.0);
     int order = int(std::clamp(rate / 1500.0, 20.0, 64.0));
     return detectAndRepair(ch, rate, threshold, std::min(maxLen, 200), order, 2);
+}
+
+std::vector<ClickEvent> findClicks(const Channels& ch, double rate, double sensitivity, double maxClickMs) {
+    const double threshold = 14.0 - std::clamp(sensitivity, 1.0, 10.0);
+    const int maxLen = std::min(200, int(std::clamp(maxClickMs, 0.1, 5.0) * rate / 1000.0));
+    const int order = int(std::clamp(rate / 1500.0, 20.0, 64.0));
+    std::vector<ClickEvent> out;
+    for (auto& g : detectGaps(ch, rate, threshold, order))
+        if (g.g1 > g.g0 && g.g1 - g.g0 <= maxLen) out.push_back({g.g0, g.g1 - g.g0, g.strength});
+    return out;
+}
+
+int repairClicks(Channels& ch, const std::vector<ClickEvent>& events) {
+    int n = 0;
+    for (auto& e : events)
+        if (interpolateGap(ch, e.start, e.start + e.length)) ++n;
+    return n;
+}
+
+bool interpolateGap(Channels& ch, int64_t g0, int64_t g1) {
+    const int64_t len = int64_t(frames(ch));
+    if (g1 <= g0 || g0 < 0 || g1 > len || g1 - g0 > kMaxInterpolate) return false;
+    Channels work = ch;
+    for (auto& x : work)
+        if (!lsarInterpolateBanded(x, long(g0), long(g1))) return false;
+    ch = std::move(work);
+    return true;
+}
+
+bool patchFromSimilar(Channels& ch, double rate, int64_t g0, int64_t g1, double* scoreOut) {
+    if (scoreOut) *scoreOut = 0;
+    const long N = long(frames(ch)), L = long(g1 - g0);
+    if (L <= 0 || g0 < 0 || g1 > N) return false;
+    const long C = std::clamp<long>(L, 1024, 8192);
+    if (g0 < C || g1 + C > N) return false;
+    // Mono sum for matching.
+    std::vector<double> m(size_t(N), 0.0);
+    for (auto& x : ch)
+        for (long i = 0; i < N; ++i) m[size_t(i)] += x[size_t(i)];
+    // Score of a candidate source start s: the audio around [s, s+L) against the audio around the gap.
+    auto score = [&](long s, long step) {
+        double ab = 0, aa = 0, bb = 0;
+        for (long i = -C; i < 0; i += step) {
+            const double t = m[size_t(g0 + i)], c = m[size_t(s + i)];
+            ab += t * c; aa += t * t; bb += c * c;
+        }
+        for (long i = 0; i < C; i += step) {
+            const double t = m[size_t(g1 + i)], c = m[size_t(s + L + i)];
+            ab += t * c; aa += t * t; bb += c * c;
+        }
+        // Penalise a level mismatch as well as a shape mismatch.
+        return aa > 0 && bb > 0 ? 2.0 * ab / (aa + bb) : 0.0;
+    };
+    auto valid = [&](long s) { return s - C >= 0 && s + L + C <= N && (s + L + C <= g0 || s - C >= g1); };
+    // Coarse search on a grid, then refine around the best few.
+    const long coarse = std::max<long>(1, long(rate / 12000.0));
+    std::vector<std::pair<double, long>> best;
+    for (long s = C; s + L + C <= N; s += coarse) {
+        if (!valid(s)) continue;
+        const double v = score(s, 4 * coarse);
+        if (best.size() < 8) { best.push_back({v, s}); std::sort(best.begin(), best.end(), std::greater<>()); }
+        else if (v > best.back().first) { best.back() = {v, s}; std::sort(best.begin(), best.end(), std::greater<>()); }
+    }
+    double bestV = 0;
+    long bestS = -1;
+    for (auto& b : best)
+        for (long s = b.second - 2 * coarse; s <= b.second + 2 * coarse; ++s) {
+            if (!valid(s)) continue;
+            const double v = score(s, 1);
+            if (v > bestV) { bestV = v; bestS = s; }
+        }
+    if (scoreOut) *scoreOut = bestV;
+    if (bestS < 0 || bestV < 0.35) return false;
+    // Copy with blends just outside the gap (the gap itself is fully replaced).
+    const long F = std::min<long>(C / 2, std::max<long>(16, long(rate * 0.004)));
+    for (auto& x : ch) {
+        const std::vector<double> src(x);
+        for (long i = -F; i < L + F; ++i) {
+            double w = 1.0;
+            if (i < 0) w = double(i + F) / double(F);
+            else if (i >= L) w = double(L + F - i) / double(F);
+            w = 0.5 - 0.5 * std::cos(3.14159265358979323846 * w);
+            x[size_t(g0 + i)] = src[size_t(g0 + i)] * (1 - w) + src[size_t(bestS + i)] * w;
+        }
+    }
+    return true;
+}
+
+bool dethump(Channels& ch, double rate, int64_t g0, int64_t g1, double cutoffHz) {
+    const long N = long(frames(ch));
+    if (g1 <= g0 || g0 < 0 || g1 > N) return false;
+    const double fc = std::clamp(cutoffHz, 40.0, 400.0);
+    const long D = std::max<long>(1, long(rate / (fc * 8.0)));
+    // The low band of a thump rings beyond the marked stretch: rebuild a little more of it.
+    const long spread = long(1.5 * rate / fc);
+    const long a = long(g0) - spread, b = long(g1) + spread;
+    const long da = a / D - 1, db = (b + D - 1) / D + 1;   // gap in decimated samples
+    const long nd = N / D;
+    if (a < 0 || b > N || da < 8 || db + 8 > nd) return false;
+    Channels out = ch;
+    for (size_t c = 0; c < ch.size(); ++c) {
+        const auto low = lowpassZeroPhase(ch[c], rate, fc);
+        std::vector<double> dec;
+        dec.resize(size_t(nd));
+        for (long i = 0; i < nd; ++i) dec[size_t(i)] = low[size_t(i * D)];
+        if (!lsarInterpolateBanded(dec, da, db)) return false;
+        // Back to the full rate (Catmull-Rom; the band is far below the decimated Nyquist).
+        auto lowAt = [&](long i) {
+            const double pos = double(i) / double(D);
+            const long k = long(std::floor(pos));
+            const double t = pos - double(k);
+            auto v = [&](long j) { return dec[size_t(std::clamp<long>(j, 0, nd - 1))]; };
+            const double p0 = v(k - 1), p1 = v(k), p2 = v(k + 1), p3 = v(k + 2);
+            return p1 + 0.5 * t * (p2 - p0 + t * (2 * p0 - 5 * p1 + 4 * p2 - p3 + t * (3 * (p1 - p2) + p3 - p0)));
+        };
+        const long i0 = da * D, i1 = std::min(N, db * D), F = 2 * D;
+        for (long i = i0; i < i1; ++i) {
+            double w = 1.0;
+            if (i - i0 < F) w = double(i - i0) / double(F);
+            else if (i1 - i <= F) w = double(i1 - i) / double(F);
+            out[c][size_t(i)] = ch[c][size_t(i)] + w * (lowAt(i) - low[size_t(i)]);
+        }
+    }
+    ch = std::move(out);
+    return true;
+}
+
+void scanGlitches(const Channels& win, size_t from, size_t to, int64_t base, std::vector<Glitch>& out) {
+    const size_t N = frames(win);
+    to = std::min(to, N);
+    if (win.empty() || from + 8 >= to) return;
+    const size_t nc = win.size();
+    // Second difference, summed over channels: a step in the waveform stands far out of it.
+    const size_t block = 2048;
+    auto d2 = [&](size_t n) {
+        double s = 0;
+        for (auto& x : win) s += std::abs(x[n] - 2 * x[n - 1] + x[n - 2]);
+        return s;
+    };
+    auto step = [&](size_t n) {
+        double s = 0;
+        for (auto& x : win) s = std::max(s, std::abs(x[n] - x[n - 1]));
+        return s;
+    };
+    auto equalAt = [&](size_t n, size_t lag) {
+        if (n < lag) return false;
+        for (size_t c = 0; c < nc; ++c)
+            if (win[c][n] != win[c][n - lag]) return false;
+        return true;
+    };
+    auto silentAt = [&](size_t n) {
+        for (size_t c = 0; c < nc; ++c)
+            if (win[c][n] != 0.0) return false;
+        return true;
+    };
+    std::vector<double> v;
+    size_t skipUntil = 0;
+    for (size_t b0 = std::max<size_t>(from, 2); b0 < to; b0 += block) {
+        const size_t b1 = std::min(to, b0 + block);
+        v.clear();
+        for (size_t n = b0; n < b1; ++n) v.push_back(d2(n));
+        std::vector<double> sorted(v);
+        std::nth_element(sorted.begin(), sorted.begin() + long(sorted.size() / 2), sorted.end());
+        const double med = sorted[sorted.size() / 2];
+        const double limit = std::max(25.0 * med, 1e-4);
+        for (size_t n = b0; n < b1; ++n) {
+            if (n < skipUntil || v[n - b0] <= limit) continue;
+            // A candidate step at about n. Is what follows a copy of earlier audio?
+            bool found = false;
+            for (size_t s = n >= 3 ? n - 3 : 0; s <= n + 3 && s + 4 < N && !found; ++s) {
+                for (int k = 6; k <= 18 && !found; ++k) {
+                    const size_t lag = size_t(1) << k;
+                    if (s < lag) break;
+                    size_t run = 0;
+                    bool anySound = false;
+                    while (s + run < N && run < lag && equalAt(s + run, lag)) { anySound = anySound || !silentAt(s + run); ++run; }
+                    if (run < 4 || !anySound) continue;
+                    // It must end with a break as well (otherwise it's a held or periodic signal).
+                    if (run >= lag) continue;
+                    size_t start = s;
+                    while (start > from && s - start < 8 && equalAt(start - 1, lag) && !silentAt(start - 1)) --start;
+                    Glitch g;
+                    g.start = base + int64_t(start);
+                    g.length = int64_t(s + run - start);
+                    g.lag = int64_t(lag);
+                    g.jump = step(start);
+                    out.push_back(g);
+                    skipUntil = s + run + 8;
+                    found = true;
+                }
+            }
+            if (found) continue;
+            // A plain break: only when it is far out of character and a real step in level.
+            if (v[n - b0] > 80.0 * std::max(med, 1e-6) && step(n) > 0.05) {
+                size_t end = n;
+                while (end + 1 < b1 && end - n < 64 && v[end + 1 - b0] > limit) ++end;
+                Glitch g;
+                g.start = base + int64_t(n);
+                g.length = int64_t(end - n + 1);
+                g.jump = step(n);
+                out.push_back(g);
+                skipUntil = end + 64;
+            }
+        }
+    }
 }
 
 ClickStats decrackle(Channels& ch, double rate, double amount) {

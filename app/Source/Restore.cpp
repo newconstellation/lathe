@@ -141,6 +141,7 @@ RestoreResult spectralEditRegion(juce::AudioFormatManager& fm, const Region& r, 
 void applyProcessed(Session& s, int id, const RestoreResult& res, const juce::String& suffix) {
     auto* r = s.findRegion(id);
     if (!r || !res.ok) return;
+    for (auto& p : r->patches) p.pos += res.srcIn - r->srcIn;   // repairs follow the audio into the new file
     r->file = res.file;
     r->fileLength = res.fileLength;
     r->srcIn = res.srcIn;

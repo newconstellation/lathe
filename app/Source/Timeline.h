@@ -42,6 +42,19 @@ public:
     std::function<void(int out, int in)> onCrossfade;
     std::function<void(int markerId)> onMarkerSelected;
     std::function<void(int markerId)> onMarkerDoubleClicked;
+    std::function<void(int markerId)> onMarkerClicked;      // released without dragging
+    std::function<void(int markerId)> onMarkerMenu;         // right-click
+    // The track bar: a click selects (the owner decides how, from the modifier keys), a drag
+    // of more than a few pixels reorders.
+    std::function<void(int track, juce::ModifierKeys)> onTrackClicked;
+    std::function<void(int track)> onTrackDoubleClicked, onTrackMenu;
+    void setSelectedTracks(const juce::Array<int>& t) { if (t != selTracks_) { selTracks_ = t; repaint(); } }
+    const juce::Array<int>& selectedTracks() const { return selTracks_; }
+    // Spots found by a scan (clicks, recording faults), drawn on their region's lane.
+    struct Spot { double t = 0; int lane = 0; bool certain = false; };
+    void setSpots(const juce::Array<Spot>& s) { spots_ = s; repaint(); }
+    // Lane buttons at the left of each lane: mute, solo, gain line.
+    juce::Rectangle<int> laneButton(int lane, int which) const;   // 0 = M, 1 = S, 2 = G
     std::function<void(int regionId)> onRegionFx;      // open the region's effects window
     std::function<void(int regionId)> onRegionRestore, onRegionSpectral;
     // Product strip (units of one product drawn under the markers); double-click a break to edit it.
@@ -206,7 +219,11 @@ private:
     juce::Array<int> selGain_;                          // selected gain nodes
     juce::Array<std::pair<int, std::pair<double, double>>> gainDrag_;   // node id -> original (t, db)
     float dragY0_ = 0;
-    int trackFrom_ = -1, trackTo_ = -1;
+    int trackFrom_ = -1, trackTo_ = -1, trackDownX_ = 0;
+    bool trackMoved_ = false, markerMoved_ = false;
+    juce::Array<int> selTracks_;
+    juce::Array<Spot> spots_;
+    bool envOn(int lane) const { return envelopeMode_ || s_.lanesGainShown.contains(lane); }
     bool changed_ = false;
     std::shared_ptr<const dsp::AnalysisResult> an_, raw_;
     bool stale_ = false, showLoudness_ = true;

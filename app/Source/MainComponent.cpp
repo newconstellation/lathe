@@ -283,9 +283,28 @@ MainComponent::MainComponent() {
         for (int i = 0; i < session_.markers.size(); ++i)
             if (session_.markers[i].id == id) { pqList_.selectRow(i); break; }
     };
-    timeline_.onMarkerDoubleClicked = [this](int id) {
+    // A marker flag: a click selects it, goes there and selects its track; a double-click opens Mark Info.
+    timeline_.onMarkerClicked = [this](int id) {
         if (auto* m = session_.findMarker(id)) locateDest(m->t);
     };
+    timeline_.onMarkerDoubleClicked = [this](int id) {
+        if (auto* m = session_.findMarker(id)) locateDest(m->t);
+        showMarkInfo();
+    };
+    timeline_.onMarkerMenu = [this](int id) { showMarkerMenu(id); };
+    timeline_.onTrackClicked = [this](int track, juce::ModifierKeys mods) { trackClicked(track, mods); };
+    timeline_.onTrackDoubleClicked = [this](int track) {
+        const auto ranges = session_.trackRanges();
+        if (!juce::isPositiveAndBelow(track, ranges.size())) return;
+        setSelectedTracks({track}, true);
+        trackAnchor_ = track;
+        timeline_.setSelection(ranges[track]);
+        locateDest(ranges[track].getStart());
+    };
+    timeline_.onTrackMenu = [this](int track) { showTrackMenu(track); };
+    pqList_.setMultipleSelectionEnabled(true);
+    recent_.fromString(props_.getUserSettings()->getValue("recentSessions"));
+    playColour_ = playBtn_.findColour(juce::TextButton::buttonColourId);
 
     auto& h = pqList_.getHeader();
     h.addColumn("Trk", pTrack, 36);
@@ -523,6 +542,7 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
                                                            juce::KeyPress::createFromDescription(k.trim()).getModifiers());
     switch (id) {
         case cmd::undo: info.setActive(!undo_.isEmpty()); break;
+        case cmd::exportSelectedTracks: info.setActive(!timeline_.selectedTracks().isEmpty()); break;
         case cmd::redo: info.setActive(!redo_.isEmpty()); break;
         case cmd::toggleEnvelope: info.setTicked(timeline_.envelopeMode()); break;
         case cmd::toggleSnap: info.setTicked(snapBtn_.getToggleState()); break;
@@ -574,20 +594,31 @@ void MainComponent::getCommandInfo(juce::CommandID id, juce::ApplicationCommandI
 
 bool MainComponent::perform(const InvocationInfo& info) {
     const double pos = engine_.positionSeconds();
+    switch (info.commandID) {   // during a take, every "play" key ends the take and keeps it
+        case cmd::playStop: case cmd::playSource: case cmd::playSourceInOut: case cmd::playSelection: case cmd::playToIn: case cmd::playFromIn:
+        case cmd::playToOut: case cmd::playFromOut: case cmd::playAroundEdit: case cmd::playFromPlayhead: case cmd::playRepeatInOut:
+            if (takeInProgress()) { endTake(); return true; }
+            break;
+        default: break;
+    }
     switch (info.commandID) {
+        case cmd::closeSession: closeSession(); break;
+        case cmd::exportSelectedTracks: withLaneCheck([this] { exportTracks(selectedTracks()); }); break;
+        case cmd::repairWindow: showRepair(); break;
+        case cmd::repairInOut: repairInOut(0); break;
         case cmd::newSession: newSession(); break;
         case cmd::openSession: openSession(); break;
         case cmd::saveSession: saveSession(false); break;
         case cmd::saveSessionAs: saveSession(true); break;
         case cmd::importAudio: importBtn_.onClick(); break;
         case cmd::openSource: showSourceOpenDialog(); break;
-        case cmd::exportDdp: exportDdp(); break;
-        case cmd::exportTrackWavs: exportTrackWavs(); break;
+        case cmd::exportDdp: withLaneCheck([this] { exportDdp(); }); break;
+        case cmd::exportTrackWavs: withLaneCheck([this] { exportTrackWavs(); }); break;
         case cmd::exportProgram24:
         case cmd::exportProgram32: showExportMenu(); break;
-        case cmd::exportInOut: exportInOut(); break;
-        case cmd::exportTracksAs: deliver("every track", trackItems(session_), false); break;
-        case cmd::exportProgrammeAs: deliver("the whole programme", {programmeItem(session_)}, false); break;
+        case cmd::exportInOut: withLaneCheck([this] { exportInOut(); }); break;
+        case cmd::exportTracksAs: withLaneCheck([this] { deliver("every track", trackItems(session_), false); }); break;
+        case cmd::exportProgrammeAs: withLaneCheck([this] { deliver("the whole programme", {programmeItem(session_)}, false); }); break;
         case cmd::undo: undo(); break;
         case cmd::redo: redo(); break;
         case cmd::splitAtPlayhead: splitAtPlayhead(); break;
@@ -609,7 +640,7 @@ bool MainComponent::perform(const InvocationInfo& info) {
             engine_.regionFx().setBypassAll(!engine_.regionFx().bypassAll());
             engine_.loadSession(session_);   // re-time the regions (latency changes when bypassed)
             break;
-        case cmd::batchRender: showBatchDialog(); break;
+        case cmd::batchRender: withLaneCheck([this] { showBatchDialog(); }); break;
         case cmd::locateMissingAudio: locateMissingAudio(true); break;
         case cmd::sourceIn: activeTimeline().setInPoint(markTime()); break;
         case cmd::sourceOut: activeTimeline().setOutPoint(markTime()); break;
@@ -712,7 +743,7 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::markInfo: showMarkInfo(); break;
         case cmd::meterBridge: showMeterBridge(); break;
         case cmd::resetMeters: meterHub_.reset(); break;
-        case cmd::exportSegments: exportSelectedSegments(); break;
+        case cmd::exportSegments: withLaneCheck([this] { exportSelectedSegments(); }); break;
         case cmd::gainOverlay: {
             const bool on = !activeTimeline().gainOverlay();
             activeTimeline().setGainOverlay(on);
@@ -863,9 +894,7 @@ bool MainComponent::perform(const InvocationInfo& info) {
         case cmd::restoreRegion: showRestore(targetRegion()); break;
         case cmd::spectralEditor: showSpectral(targetRegion()); break;
         case cmd::record:
-            if (print_.printing) finishPrint();
-            else if (cap_.capturing) finishCapture();
-            else if (engine_.isRecording()) finishRecording();
+            if (takeInProgress()) endTake();
             else showRecordDialog();
             break;
         case cmd::capture: showCapture(); break;
@@ -919,13 +948,23 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
     auto add = [&](std::initializer_list<juce::CommandID> ids) { for (auto id : ids) m.addCommandItem(&commands_, id); };
     switch (index) {
         case 0:
-            add({cmd::newSession, cmd::openSession, cmd::saveSession, cmd::saveSessionAs});
+            add({cmd::newSession, cmd::openSession});
+            {
+                juce::PopupMenu rm;
+                for (int i = 0; i < recent_.size(); ++i)
+                    rm.addItem(9000 + i, recent_.label(i) + (recent_.exists(i) ? juce::String() : juce::String("   (missing)")), true, false);
+                if (recent_.size() > 0) rm.addSeparator();
+                rm.addItem(9099, "Clear Menu", recent_.size() > 0);
+                m.addSubMenu("Open Recent", rm);
+            }
+            add({cmd::closeSession, cmd::saveSession, cmd::saveSessionAs});
             m.addSeparator();
             add({cmd::importAudio, cmd::openSource, cmd::openDdpSession, cmd::locateMissingAudio});
             m.addSeparator();
             add({cmd::batchRender});
             m.addSeparator();
-            add({cmd::exportDdp, cmd::exportTrackWavs, cmd::exportProgram24, cmd::exportTracksAs, cmd::exportProgrammeAs, cmd::exportInOut, cmd::exportSegments});
+            add({cmd::exportDdp, cmd::exportTrackWavs, cmd::exportProgram24, cmd::exportTracksAs, cmd::exportSelectedTracks, cmd::exportProgrammeAs, cmd::exportInOut,
+                 cmd::exportSegments});
             break;
         case 1:
             add({cmd::undo, cmd::redo});
@@ -964,7 +1003,7 @@ juce::PopupMenu MainComponent::getMenuForIndex(int index, const juce::String&) {
             }
             add({cmd::regionEffects, cmd::bypassRegionFx});
             m.addSeparator();
-            add({cmd::restoreRegion, cmd::spectralEditor});
+            add({cmd::repairWindow, cmd::repairInOut, cmd::restoreRegion, cmd::spectralEditor});
             m.addSeparator();
             add({cmd::nudgeLeft, cmd::nudgeRight, cmd::nudgeLeftBig, cmd::nudgeRightBig});
             break;
@@ -1911,6 +1950,7 @@ void MainComponent::finishRecording() {
     timeline_.resized();
     timeline_.selectRegion(reg.id);
     commands_.commandStatusChanged();
+    checkTake(reg.id, engine_.recordLostSamples(), engine_.recordLostEvents(), engine_.recordDropouts());
 }
 
 // ---------------------------------------------------------------- audio setup settings, capture
@@ -2104,6 +2144,7 @@ void MainComponent::finishCapture() {
                                                   : "!Stopped early: kept the first " + msfString(got) + " of " + msfString(want) + ".";
     if (overs > 0) cap_.message = "!" + cap_.message.trimCharactersAtStart("!") + " The return clipped (" + juce::String(overs) + " samples): turn the gear down and capture again.";
     commands_.commandStatusChanged();
+    checkTake(id, engine_.recordLostSamples(), engine_.recordLostEvents(), engine_.recordDropouts());
 }
 
 void MainComponent::captureHear(int which) {
@@ -2401,6 +2442,7 @@ void MainComponent::finishPrint() {
     print_.message = (complete || got >= want - 0.01 ? "Printed " + msfString(got) : "Stopped early: kept the first " + msfString(got) + " of " + msfString(want)) +
                      " onto lane " + juce::String(print_.plan.underLane + 2) + ". The print is playing; Use live gear switches back, and Undo removes it.";
     commands_.commandStatusChanged();
+    checkTake(id, engine_.recordLostSamples(), engine_.recordLostEvents(), engine_.recordDropouts());
 }
 
 void MainComponent::gearHear(int gear, int which) {
@@ -2685,6 +2727,31 @@ void MainComponent::runNullTest() {
                    [this, a, b, diff, res](bool) {
                        auto text = res->toText(a.getFileName(), b.getFileName());
                        if (res->ok) text << "\nDifference file (A minus B, 32-bit float):\n  " << diff.getFullPathName() << "\n";
+                       // When one of the files is on the timeline, its differences go on the timeline
+                       // and into the Repair list.
+                       if (res->ok && !res->differences.isEmpty()) {
+                           for (auto& reg : session_.regions) {
+                               const bool isA = reg.file == a, isB = reg.file == b;
+                               if (!isA && !isB) continue;
+                               repairRegion_ = reg.id;
+                               repairItems_.clear();
+                               for (auto& d : res->differences) {
+                                   RepairSpot sp;
+                                   sp.pos = d.start + (isB ? res->offset : 0);
+                                   sp.length = juce::jmax<juce::int64>(1, d.length);
+                                   sp.kind = d.kind + (d.inFile == "?" ? juce::String() : " in " + (d.inFile == "A" ? a.getFileName() : b.getFileName()));
+                                   sp.certain = true;
+                                   sp.strength = d.peak;
+                                   if (sp.pos >= reg.srcIn && sp.pos < reg.srcOut) repairItems_.add({sp, d.inFile != (isA ? "B" : "A"), false});
+                               }
+                               if (!repairItems_.isEmpty()) {
+                                   repairStatus_ = "From the null test: where " + reg.name + " differs from the other file. Faults in the other file are listed unticked.";
+                                   text << "\nThese spots are marked on the timeline on " << reg.name << " and listed in the Repair window.\n";
+                                   showRepair();
+                               }
+                               break;
+                           }
+                       }
                        showText("Null test", text);
                    });
         });
@@ -2733,6 +2800,7 @@ void MainComponent::sessionChanged(bool undoable) {
     pqList_.updateContent();
     pqList_.repaint();
     refreshIssues();
+    refreshRepair();
     if (xfadeEditor_) {
         if (xfadeEditor_->stillValid()) xfadeEditor_->refresh();
         else juce::MessageManager::callAsync([this] { xfadeWindow_.reset(); });
@@ -2809,6 +2877,13 @@ void MainComponent::newSession() {
     refWindow_.reset();
     analysisWindow_.reset();
     session_ = Session();
+    repairWindow_.reset();
+    repairItems_.clear();
+    repairRegion_ = 0;
+    takeReport_.clear();
+    timeline_.setSpots({});
+    timeline_.setSelectedTracks({});
+    trackAnchor_ = -1;
     attachSource();
     juce::StringArray problems;
     engine_.chain().setState({}, problems);
@@ -2838,6 +2913,13 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
     analysisWindow_.reset();
     restoreWindow_.reset();
     spectralWindow_.reset();
+    repairWindow_.reset();
+    repairItems_.clear();
+    repairRegion_ = 0;
+    takeReport_.clear();
+    timeline_.setSpots({});
+    timeline_.setSelectedTracks({});
+    trackAnchor_ = -1;
     session_ = s;
     attachSource();
     // Audio that moved with the session (same folder, or an Audio folder beside it) is found silently.
@@ -2856,6 +2938,7 @@ bool MainComponent::loadSessionFile(const juce::File& f) {
     dirty_ = foundBeside > 0;   // new locations: worth saving
     if (!problems.isEmpty()) showText("Session opened with plugin problems", "Plugin problems:\n" + problems.joinIntoString("\n"));
     if (missing) juce::MessageManager::callAsync([this] { locateMissingAudio(false); });
+    if (f.getFileName() != "autosave.lathe") noteRecent(f);
     return true;
 }
 
@@ -2865,10 +2948,10 @@ void MainComponent::openSession() {
                           [this](const juce::FileChooser& fc) { if (fc.getResult().existsAsFile()) loadSessionFile(fc.getResult()); });
 }
 
-bool MainComponent::saveSession(bool saveAs) {
+bool MainComponent::saveSession(bool saveAs, std::function<void()> then) {
     engine_.regionFx().syncAndCapture(session_);
     session_.pluginChainState = engine_.chain().getState();
-    auto doSave = [this](const juce::File& f) {
+    auto doSave = [this, then](const juce::File& f) {
         juce::String err;
         if (!session_.save(f, err)) {
             juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Save failed", err);
@@ -2876,6 +2959,8 @@ bool MainComponent::saveSession(bool saveAs) {
         }
         dirty_ = false;
         if (auto* w = findParentComponentOfClass<juce::DocumentWindow>()) w->setName("Lathe - " + f.getFileNameWithoutExtension());
+        noteRecent(f);
+        if (then) then();
         return true;
     };
     if (!saveAs && session_.file != juce::File()) return doSave(session_.file);
@@ -3001,7 +3086,17 @@ void MainComponent::locateDest(double t) {
     timeline_.setPlayhead(t, false);
 }
 
+void MainComponent::endTake() {
+    if (print_.printing) finishPrint();
+    else if (cap_.capturing) finishCapture();
+    else if (engine_.isRecording()) {
+        finishRecording();
+        if (engine_.isPlaying() || engine_.isSourcePlaying()) stopAll();
+    }
+}
+
 void MainComponent::stopAll() {
+    if (engine_.isRecording()) finishRecording();      // keeps what was recorded
     if (print_.printing) { finishPrint(); return; }    // keeps what was recorded
     if (cap_.capturing) { finishCapture(); return; }   // keeps what was recorded
     if (cap_.levelCheck) captureLevelCheck(false);
@@ -3029,6 +3124,7 @@ void MainComponent::afterStop() {
 }
 
 void MainComponent::togglePlay() {
+    if (takeInProgress()) { endTake(); return; }   // Play is Stop while recording
     if (engine_.isPlaying() || engine_.isSourcePlaying()) { stopAll(); return; }
     auditionEnd_ = -1;
     auto& st = sourceView_.timeline();
@@ -3674,6 +3770,7 @@ void MainComponent::refreshIssues() {
     for (auto& r : session_.regions)
         if (!r.file.existsAsFile()) missing.addIfNotAlreadyThere(r.file.getFileName());
     for (auto& m : missing) { ++errors; s << "ERROR  Missing file: " << m << "\n"; }
+    if (takeReport_.isNotEmpty()) s << takeReport_ << "\n";
     juce::String head = juce::String(int(disc.tracks.size())) + " tracks, " + msfString(session_.end()) + ". ";
     head << (errors ? juce::String(errors) + " problem(s) to fix before DDP.\n" : "Ready for DDP.\n");
     issues_.setText(head + s);
@@ -3769,10 +3866,17 @@ void MainComponent::showExportMenu() {
     m.addItem(2, "WAV, 16-bit / 44.1 kHz (as on the CD)");
     m.addItem(11, "WAV, 24-bit at the project rate");
     m.addItem(12, "Other format (MP3, AAC, Apple Lossless)...");
+    {
+        const int n = selectedTracks().size();
+        m.addItem(15, n == 1 ? "Selected track (track " + juce::String(selectedTracks()[0] + 1) + ")..." : n > 1 ? "Selected tracks (" + juce::String(n) + ")..." : juce::String("Selected tracks... (click a track on the yellow bar or in the list)"), n > 0);
+    }
     m.addSectionHeader("PART");
     m.addItem(13, juce::String("In-Out") + (sourceActive_ ? " of the source" : "") + "...", !activeTimeline().selection().isEmpty());
     m.addItem(14, "Selected segments...");
-    m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&exportBtn_), [this](int r) {
+    m.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&exportBtn_), [this](int choice) {
+      if (choice <= 0) return;
+      withLaneCheck([this, r = choice] {
+        if (r == 15) exportTracks(selectedTracks());
         if (r == 1) exportDdp();
         if (r == 2) exportTrackWavs();
         if (r == 10) deliver("the whole programme", {programmeItem(session_)}, false);
@@ -3802,6 +3906,7 @@ void MainComponent::showExportMenu() {
                        });
             });
         }
+      });
     });
 }
 
@@ -4186,7 +4291,14 @@ void MainComponent::timerCallback() {
     selDisplay_.setText(sel.isEmpty() ? juce::String() : "Dest In " + msfString(sel.getStart()) + "  Out " + msfString(sel.getEnd()) +
                                                               "  (" + msfString(sel.getLength()) + ")",
                         juce::dontSendNotification);
-    playBtn_.setButtonText(engine_.isPlaying() ? "Stop" : "Play");
+    {
+        const int look = takeInProgress() ? 2 : engine_.isPlaying() ? 1 : 0;   // during a take, Play is a red Stop
+        if (look != playLook_) {
+            playLook_ = look;
+            playBtn_.setButtonText(look ? "Stop" : "Play");
+            playBtn_.setColour(juce::TextButton::buttonColourId, look == 2 ? juce::Colour(0xffc23a34) : playColour_);
+        }
+    }
     if (sourceActive_ || engine_.isSourcePlaying()) {
         const double sp = engine_.sourcePosition();
         timeDisplay_.setText(msfString(engine_.isSourcePlaying() ? sp : sourceView_.timeline().editPoint()), juce::dontSendNotification);
@@ -4281,8 +4393,16 @@ void MainComponent::timerCallback() {
                                        : "Monitoring at " + juce::String(dr / 1000.0, 1) + " kHz (resampled); project " + juce::String(pr / 1000.0, 1) + " kHz";
     else if (!session_.regions.isEmpty())
         rw = "Playing at the project rate, " + juce::String(dr / 1000.0, 1) + " kHz (no resampling)";
+    bool takeTrouble = false;
+    if (takeInProgress()) {
+        const auto lost = engine_.recordLostSamples();
+        const int drops = engine_.recordDropouts();
+        if (lost > 0) rw = "THE DISK CAN'T KEEP UP: " + juce::String(lost) + " samples lost so far. Stop other disk activity or record to a faster drive.";
+        else if (drops > 0) rw = "The interface has reported " + juce::String(drops) + (drops == 1 ? " dropout" : " dropouts") + " during this take.";
+        takeTrouble = lost > 0 || drops > 0;
+    }
     rateWarning_.setText(rw, juce::dontSendNotification);
-    rateWarning_.setColour(juce::Label::textColourId, std::abs(pr - dr) > 0.5 ? colours::accent : colours::ok);
+    rateWarning_.setColour(juce::Label::textColourId, takeTrouble ? colours::error : std::abs(pr - dr) > 0.5 ? colours::accent : colours::ok);
 }
 
 // ---------------------------------------------------------------- delivery
@@ -4467,12 +4587,24 @@ void MainComponent::showLaneMenu(bool source, int lane) {
     m.addItem(6, "5.1 (L R C LFE Ls Rs)", true, f == 6);
     m.addSeparator();
     m.addItem(10, ss.laneTargeted(lane) ? "Leave this lane out of edits (None)" : "Include this lane in edits");
+    m.addSeparator();
+    m.addItem(20, "Insert Lane Above");
+    m.addItem(21, "Insert Lane Below");
+    {
+        bool empty = ss.lanes > 1;
+        for (auto& r : ss.regions) empty &= r.lane != lane;
+        m.addItem(22, empty ? "Delete Lane" : ss.lanes > 1 ? "Delete Lane (only when it has no audio)" : "Delete Lane (the only lane)", empty);
+    }
     m.showMenuAsync({}, [this, source, lane](int r) {
         auto& s2 = source ? srcSession_ : session_;
         if (r == 1 || r == 2 || r == 6) s2.setLaneFormat(lane, r);
+        else if (r == 20) s2.insertLane(lane);
+        else if (r == 21) s2.insertLane(lane + 1);
+        else if (r == 22) { if (!s2.deleteLane(lane)) return; }
         else if (r == 10) { if (s2.laneTargeted(lane)) s2.lanesOff.addIfNotAlreadyThere(lane); else s2.lanesOff.removeAllInstancesOf(lane); }
         else return;
         sessionChanged();
+        (source ? sourceView_.timeline() : timeline_).resized();
         (source ? sourceView_.timeline() : timeline_).repaint();
     });
 }
@@ -4822,6 +4954,460 @@ void MainComponent::finishRelink(std::shared_ptr<RelinkState> st) {
     }
     msg << "\n\nSave the session to keep the new locations.";
     juce::AlertWindow::showMessageBoxAsync(still.isEmpty() ? juce::MessageBoxIconType::InfoIcon : juce::MessageBoxIconType::WarningIcon, "Locate Missing Audio", msg);
+}
+
+}  // namespace lathe
+
+namespace lathe {
+
+// ---------------------------------------------------------------- close, recent sessions
+
+void MainComponent::closeSession() {
+    auto close = [this] {
+        if (takeInProgress()) endTake();
+        stopAll();
+        for (auto* w : {&markInfoWindow_, &textViewWindow_, &xfadeWindow_, &creditsWindow_, &restoreWindow_, &spectralWindow_, &fxWindow_, &breakWindow_,
+                        &repairWindow_, &analysisWindow_})
+            w->reset();
+        srcSession_ = Session();
+        newSession();
+        dirty_ = false;
+        if (auto* w = findParentComponentOfClass<juce::DocumentWindow>()) w->setName("Lathe");
+    };
+    if (!dirty_ || (session_.regions.isEmpty() && session_.markers.isEmpty() && session_.file == juce::File())) { close(); return; }
+    const auto name = session_.file != juce::File() ? session_.file.getFileNameWithoutExtension() : juce::String("this session");
+    auto options = juce::MessageBoxOptions::makeOptionsYesNoCancel(juce::MessageBoxIconType::QuestionIcon, "Save changes?",
+                                                                   "Save the changes to " + name + " before closing it?", "Save", "Don't Save", "Cancel");
+    juce::AlertWindow::showAsync(options, [this, close](int r) {
+        if (r == 1) saveSession(false, close);   // (asks where, when it has never been saved; closes once saved)
+        else if (r == 2) close();
+    });
+}
+
+void MainComponent::noteRecent(const juce::File& f) {
+    recent_.add(f);
+    props_.getUserSettings()->setValue("recentSessions", recent_.toString());
+    props_.saveIfNeeded();
+    menuItemsChanged();
+}
+
+void MainComponent::openRecent(int index) {
+    const auto f = recent_[index];
+    if (f == juce::File()) return;
+    if (!f.existsAsFile()) {
+        auto options = juce::MessageBoxOptions::makeOptionsOkCancel(juce::MessageBoxIconType::WarningIcon, "Session not found",
+                                                                    f.getFullPathName() + "\n\nIt has been moved, renamed or deleted, or its drive isn't connected.",
+                                                                    "Remove from the List", "Keep");
+        juce::AlertWindow::showAsync(options, [this, f](int r) {
+            if (r != 1) return;
+            recent_.remove(f);
+            props_.getUserSettings()->setValue("recentSessions", recent_.toString());
+            menuItemsChanged();
+        });
+        return;
+    }
+    auto open = [this, f] { loadSessionFile(f); };
+    if (!dirty_ || (session_.regions.isEmpty() && session_.markers.isEmpty())) { open(); return; }
+    auto options = juce::MessageBoxOptions::makeOptionsYesNoCancel(juce::MessageBoxIconType::QuestionIcon, "Save changes?",
+                                                                   "Save the changes to the open session first?", "Save", "Don't Save", "Cancel");
+    juce::AlertWindow::showAsync(options, [this, open](int r) {
+        if (r == 1) saveSession(false, open);
+        else if (r == 2) open();
+    });
+}
+
+void MainComponent::menuItemSelected(int id, int) {
+    if (id == 9099) {
+        recent_.clear();
+        props_.getUserSettings()->setValue("recentSessions", recent_.toString());
+        menuItemsChanged();
+    } else if (id >= 9000 && id < 9000 + RecentSessions::kMax) {
+        openRecent(id - 9000);
+    }
+}
+
+// ---------------------------------------------------------------- what you hear is what is exported
+
+void MainComponent::withLaneCheck(std::function<void()> go) {
+    const auto w = session_.laneStateWarning();
+    if (w.isEmpty()) { go(); return; }
+    auto options = juce::MessageBoxOptions::makeOptionsOkCancel(
+        juce::MessageBoxIconType::WarningIcon, "Export what you are hearing?",
+        "Right now " + w + ".\n\nExports, DDP images and batch renders deliver exactly what plays, so this will be left out or changed in the files too.",
+        "Export Anyway", "Cancel");
+    juce::AlertWindow::showAsync(options, [go](int r) { if (r == 1) go(); });
+}
+
+// ---------------------------------------------------------------- track selection
+
+juce::Array<int> MainComponent::selectedTracks() const {
+    juce::Array<int> t;
+    const int n = session_.trackRanges().size();
+    for (int i : timeline_.selectedTracks())
+        if (juce::isPositiveAndBelow(i, n)) t.addIfNotAlreadyThere(i);
+    t.sort();
+    return t;
+}
+
+int MainComponent::rowOfTrack(int track) const {
+    int n = -1;
+    for (int i = 0; i < session_.markers.size(); ++i)
+        if (session_.markers[i].type == Marker::TrackStart && ++n == track) return i;
+    return -1;
+}
+
+void MainComponent::setSelectedTracks(juce::Array<int> tracks, bool updateList) {
+    timeline_.setSelectedTracks(tracks);
+    if (updateList) {
+        juce::SparseSet<int> rows;
+        for (int t : tracks)
+            if (int row = rowOfTrack(t); row >= 0) rows.addRange({row, row + 1});
+        syncingTracks_ = true;
+        pqList_.setSelectedRows(rows, juce::dontSendNotification);
+        syncingTracks_ = false;
+    }
+    commands_.commandStatusChanged();
+}
+
+void MainComponent::selectedRowsChanged(int) {
+    if (syncingTracks_) return;
+    juce::Array<int> tracks;
+    const auto rows = pqList_.getSelectedRows();
+    for (int i = 0; i < rows.size(); ++i) {
+        const int row = rows[i];
+        if (row < session_.markers.size() && session_.markers[row].type == Marker::TrackStart) tracks.add(markerRowToTrackNumber(row) - 1);
+    }
+    setSelectedTracks(tracks, false);
+    if (tracks.size() == 1) trackAnchor_ = tracks[0];
+}
+
+void MainComponent::trackClicked(int track, juce::ModifierKeys mods) {
+    auto sel = selectedTracks();
+    if (mods.isShiftDown() && trackAnchor_ >= 0) {
+        sel.clear();
+        for (int i = juce::jmin(trackAnchor_, track); i <= juce::jmax(trackAnchor_, track); ++i) sel.add(i);
+    } else if (mods.isCommandDown()) {
+        if (sel.contains(track)) sel.removeAllInstancesOf(track); else sel.add(track);
+        trackAnchor_ = track;
+    } else {
+        sel = {track};
+        trackAnchor_ = track;
+    }
+    setSelectedTracks(sel, true);
+    if (int row = rowOfTrack(track); row >= 0) pqList_.scrollToEnsureRowIsOnscreen(row);
+}
+
+void MainComponent::exportTracks(juce::Array<int> tracks) {
+    const auto all = trackItems(session_);
+    juce::Array<DeliveryItem> items;
+    for (int t : tracks)
+        if (juce::isPositiveAndBelow(t, all.size())) items.add(all[t]);
+    if (items.isEmpty()) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Export Selected Tracks",
+                                               "Select a track first: click it on the yellow track bar above the waveform, or in the track list. "
+                                               "Shift-click selects a run, Cmd-click adds or removes one.");
+        return;
+    }
+    juce::String what = items.size() == 1 ? "track " + juce::String(tracks[0] + 1) : juce::String(items.size()) + " selected tracks";
+    deliver(what, items, false);
+}
+
+void MainComponent::showTrackMenu(int track) {
+    const auto ranges = session_.trackRanges();
+    if (!juce::isPositiveAndBelow(track, ranges.size())) return;
+    if (!selectedTracks().contains(track)) { setSelectedTracks({track}, true); trackAnchor_ = track; }
+    const int n = selectedTracks().size();
+    juce::PopupMenu m;
+    m.addSectionHeader("Track " + juce::String(track + 1));
+    m.addItem(1, "Export This Track...");
+    if (n > 1) m.addItem(2, "Export the " + juce::String(n) + " Selected Tracks...");
+    m.addSeparator();
+    m.addItem(3, "Play Track");
+    m.addItem(4, "Set In-Out to Track");
+    m.addSeparator();
+    m.addItem(5, "Mark Info...");
+    m.showMenuAsync({}, [this, track, r = ranges[track]](int c) {
+        if (c == 1) withLaneCheck([this, track] { exportTracks({track}); });
+        if (c == 2) withLaneCheck([this] { exportTracks(selectedTracks()); });
+        if (c == 3) { setActiveTimeline(false); if (engine_.isPlaying() || engine_.isSourcePlaying()) stopAll(); playRange(false, r.getStart(), r.getEnd()); }
+        if (c == 4) { timeline_.setSelection(r); locateDest(r.getStart()); }
+        if (c == 5) {
+            if (int row = rowOfTrack(track); row >= 0) timeline_.selectMarker(session_.markers[row].id);
+            showMarkInfo();
+        }
+    });
+}
+
+void MainComponent::showMarkerMenu(int id) {
+    auto* mk = session_.findMarker(id);
+    if (!mk) return;
+    const bool track = mk->type == Marker::TrackStart;
+    juce::PopupMenu m;
+    if (track) m.addItem(1, "Rename Track...");
+    m.addItem(2, mk->locked ? "Unlock Marker" : "Lock Marker");
+    m.addItem(3, "Mark Info...");
+    m.addSeparator();
+    m.addItem(4, "Delete Marker");
+    m.showMenuAsync({}, [this, id](int c) {
+        auto* k = session_.findMarker(id);
+        if (!k) return;
+        if (c == 2) { k->locked = !k->locked; sessionChanged(); }
+        if (c == 3) showMarkInfo();
+        if (c == 4) { session_.removeMarker(id); sessionChanged(); }
+        if (c == 1) {
+            auto* aw = new juce::AlertWindow("Rename Track", "Title (this is the CD-Text title, and the name of the exported file):", juce::MessageBoxIconType::NoIcon);
+            aw->addTextEditor("title", juce::String::fromUTF8(k->text.title.c_str()));
+            aw->addButton("OK", 1, juce::KeyPress(juce::KeyPress::returnKey));
+            aw->addButton("Cancel", 0, juce::KeyPress(juce::KeyPress::escapeKey));
+            aw->enterModalState(true, juce::ModalCallbackFunction::create([this, aw, id](int r) {
+                if (r != 1) return;
+                if (auto* k2 = session_.findMarker(id)) { k2->text.title = aw->getTextEditorContents("title").trim().toStdString(); sessionChanged(); }
+            }), true);
+        }
+    });
+}
+
+// ---------------------------------------------------------------- repairs
+
+namespace {
+juce::String spanText(juce::int64 samples, double rate) {
+    return samples < 200 ? juce::String(samples) + (samples == 1 ? " sample" : " samples") : juce::String(double(samples) / rate * 1000.0, 1) + " ms";
+}
+}  // namespace
+
+bool MainComponent::repairSpan(const Region& r, juce::int64& a, juce::int64& b, bool wholeWhenNoInOut) const {
+    const auto sel = timeline_.selection();
+    if (sel.isEmpty() || sel.getEnd() <= r.start || sel.getStart() >= r.end()) {
+        if (!wholeWhenNoInOut) return false;
+        a = r.srcIn;
+        b = r.srcOut;
+        return b > a;
+    }
+    a = juce::jlimit(r.srcIn, r.srcOut, r.srcIn + juce::int64(std::llround((sel.getStart() - r.start) * r.fileRate)));
+    b = juce::jlimit(r.srcIn, r.srcOut, r.srcIn + juce::int64(std::llround((sel.getEnd() - r.start) * r.fileRate)));
+    return b > a;
+}
+
+void MainComponent::refreshRepair() {
+    const auto* r = session_.findRegion(repairRegion_);
+    if (!r) { repairItems_.clear(); repairRegion_ = 0; }
+    juce::Array<Timeline::Spot> spots;
+    juce::Array<RepairPanel::Row> rows;
+    for (auto& it : repairItems_) {
+        const double t = r->start + double(it.spot.pos - r->srcIn) / r->fileRate;
+        RepairPanel::Row row;
+        row.time = msfString(juce::jmax(0.0, t));
+        row.kind = it.spot.kind;
+        row.length = spanText(it.spot.length, r->fileRate);
+        row.certain = it.spot.certain;
+        row.ticked = it.ticked;
+        row.repaired = it.repaired;
+        rows.add(row);
+        if (!it.repaired && it.spot.pos >= r->srcIn && it.spot.pos < r->srcOut) spots.add({t, r->lane, it.spot.certain});
+    }
+    timeline_.setSpots(spots);
+    if (repairPanel_) {
+        repairPanel_->setRegionName(r ? r->name : juce::String());
+        repairPanel_->setRows(rows);
+        repairPanel_->setStatus(repairStatus_);
+        repairPanel_->setHearMode(session_.patchMode);
+    }
+}
+
+void MainComponent::setHearRepair(int mode) {
+    if (session_.patchMode == mode) return;
+    session_.patchMode = mode;
+    engine_.loadSession(session_);   // (not saved, not an undo step: it only changes what plays)
+    if (repairPanel_) repairPanel_->setHearMode(mode);
+}
+
+void MainComponent::showRepair() {
+    if (int id = targetRegion(); id != 0 && id != repairRegion_ && (repairItems_.isEmpty() || !repairWindow_)) {
+        repairRegion_ = id;
+        repairItems_.clear();
+        repairStatus_.clear();
+    }
+    if (repairWindow_) { refreshRepair(); repairWindow_->toFront(true); return; }
+    auto* p = new RepairPanel();
+    repairPanel_ = p;
+    p->onRepairInOut = [this] { if (repairPanel_) repairInOut(repairPanel_->mode()); };
+    p->onRemoveInOut = [this] { removeRepairsInOut(); };
+    p->onFindClicks = [this] { repairFind(false); };
+    p->onCheckFaults = [this] { repairFind(true); };
+    p->onRepairTicked = [this] { repairTicked(); };
+    p->onClearList = [this] { repairItems_.clear(); repairStatus_.clear(); refreshRepair(); };
+    p->onTick = [this](int row, bool on) { if (juce::isPositiveAndBelow(row, repairItems_.size())) repairItems_.getReference(row).ticked = on; };
+    p->onHearMode = [this](int mode) { setHearRepair(mode); };
+    p->onRowClicked = [this](int row) {
+        const auto* r = session_.findRegion(repairRegion_);
+        if (!r || !juce::isPositiveAndBelow(row, repairItems_.size())) return;
+        const auto& sp = repairItems_.getReference(row).spot;
+        const double t = r->start + double(sp.pos - r->srcIn) / r->fileRate, len = double(sp.length) / r->fileRate;
+        setActiveTimeline(false);
+        if (engine_.isPlaying() || engine_.isSourcePlaying()) stopAll();
+        timeline_.selectRegion(r->id);
+        timeline_.setSelection({t, t + juce::jmax(len, 1.0 / r->fileRate)});   // In-Out on the spot, ready for Repair In-Out
+        locateDest(t);
+        playRange(false, t - 1.0, t + len + 1.0);
+    };
+    auto* w = new PlainWindow(p, "Repair", true);
+    w->onClose = [this] {
+        juce::MessageManager::callAsync([this] {
+            setHearRepair(0);   // never leave "original" or "what was removed" playing behind a closed window
+            repairWindow_.reset();
+        });
+    };
+    repairWindow_.reset(w);
+    refreshRepair();
+}
+
+void MainComponent::repairInOut(int mode) {
+    int id = repairWindow_ && repairRegion_ != 0 ? repairRegion_ : targetRegion();
+    // The region under the In-Out on the selected lane wins over an older choice.
+    const auto sel = timeline_.selection();
+    if (!sel.isEmpty())
+        if (auto* cur = session_.findRegion(id); !cur || sel.getEnd() <= cur->start || sel.getStart() >= cur->end())
+            for (auto& x : session_.regions)
+                if (x.lane == timeline_.selectedLane() && sel.getStart() < x.end() && sel.getEnd() > x.start) { id = x.id; break; }
+    auto* r = session_.findRegion(id);
+    juce::int64 a = 0, b = 0;
+    if (!r || !repairSpan(*r, a, b, false)) {
+        juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon, "Repair In-Out",
+                                               "Mark the damage first: put In (I) just before it and Out (O) just after it, on the region to repair. "
+                                               "Zoom right in; the tighter the marks, the cleaner the repair.");
+        return;
+    }
+    if (id != repairRegion_) { repairRegion_ = id; repairItems_.clear(); }
+    auto snapshot = std::make_shared<Region>(*r);
+    auto res = std::make_shared<RepairResult>();
+    const auto folder = processedFolder();
+    runJob("Repairing...", [this, snapshot, a, b, mode, folder, res](Job&) { *res = repairRange(engine_.formats(), *snapshot, a, b, RepairMode(mode), folder); },
+           [this, id, res, a, b](bool) {
+               auto* reg = session_.findRegion(id);
+               if (!reg) return;
+               if (!res->ok) {
+                   repairStatus_ = "!" + res->error;
+                   if (repairPanel_) refreshRepair();
+                   else juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "Repair In-Out", res->error);
+                   return;
+               }
+               reg->patches.addArray(res->patches);
+               for (auto& it : repairItems_)
+                   if (it.spot.pos >= a && it.spot.pos + it.spot.length <= b) it.repaired = true;
+               repairStatus_ = res->report + "  Cmd+Z undoes it; Hear Original compares.";
+               sessionChanged();
+               refreshRepair();
+           });
+}
+
+void MainComponent::removeRepairsInOut() {
+    auto* r = session_.findRegion(repairRegion_ != 0 ? repairRegion_ : targetRegion());
+    juce::int64 a = 0, b = 0;
+    if (!r || !repairSpan(*r, a, b, false)) { repairStatus_ = "!Mark an In-Out over the repairs to take off."; refreshRepair(); return; }
+    const int n = removePatches(*r, a, b);
+    for (auto& it : repairItems_)
+        if (it.spot.pos < b && it.spot.pos + it.spot.length > a) it.repaired = false;
+    repairStatus_ = n == 0 ? juce::String("There are no repairs inside the In-Out.") : "Took off " + juce::String(n) + (n == 1 ? " repair" : " repairs") + ": that audio plays as recorded again.";
+    sessionChanged();
+    refreshRepair();
+}
+
+void MainComponent::repairFind(bool faults) {
+    if (int id = targetRegion(); id != 0 && id != repairRegion_) { repairRegion_ = id; repairItems_.clear(); }
+    auto* r = session_.findRegion(repairRegion_);
+    juce::int64 a = 0, b = 0;
+    if (!r || !repairSpan(*r, a, b, true)) { repairStatus_ = "!Select a region on the timeline first."; refreshRepair(); return; }
+    auto snapshot = std::make_shared<Region>(*r);
+    auto found = std::make_shared<juce::Array<RepairSpot>>();
+    const double sens = repairPanel_ ? repairPanel_->sensitivity() : 0.5, maxMs = repairPanel_ ? repairPanel_->maxClickMs() : 2.0;
+    const int id = r->id;
+    const bool whole = a == r->srcIn && b == r->srcOut;
+    runJob(faults ? "Checking for recording faults..." : "Looking for clicks...",
+           [this, snapshot, found, a, b, sens, maxMs, faults](Job& j) {
+               auto keep = [&](double p) { return j.keep(p); };
+               *found = faults ? scanTake(engine_.formats(), *snapshot, a, b, keep) : findClicks(engine_.formats(), *snapshot, a, b, sens, maxMs, keep);
+           },
+           [this, found, id, faults, whole](bool cancelled) {
+               if (cancelled || id != repairRegion_) return;
+               repairItems_.clear();
+               for (auto& sp : *found) repairItems_.add({sp, true, false});
+               const juce::String where = whole ? "the region" : "the In-Out";
+               if (found->isEmpty()) repairStatus_ = faults ? "No recording faults in " + where + ": no repeated audio and no breaks." : "No clicks found in " + where + ". Raise Sensitivity to look harder.";
+               else repairStatus_ = juce::String(found->size()) + (faults ? " possible fault" : " click") + (found->size() == 1 ? "" : "s") + " in " + where +
+                                    ", marked on the timeline. Click one to hear it; untick any that are really music; then Repair Ticked.";
+               refreshRepair();
+           });
+}
+
+void MainComponent::repairTicked() {
+    auto* r = session_.findRegion(repairRegion_);
+    if (!r) return;
+    juce::Array<RepairSpot> spots;
+    juce::Array<int> which;
+    for (int i = 0; i < repairItems_.size(); ++i)
+        if (auto& it = repairItems_.getReference(i); it.ticked && !it.repaired) { spots.add(it.spot); which.add(i); }
+    if (spots.isEmpty()) { repairStatus_ = "!Nothing is ticked."; refreshRepair(); return; }
+    auto snapshot = std::make_shared<Region>(*r);
+    auto res = std::make_shared<RepairResult>();
+    const auto folder = processedFolder();
+    const int id = r->id;
+    runJob("Repairing " + juce::String(spots.size()) + (spots.size() == 1 ? " spot..." : " spots..."),
+           [this, snapshot, spots, folder, res](Job& j) { *res = repairSpots(engine_.formats(), *snapshot, spots, folder, [&](double p) { return j.keep(p); }); },
+           [this, id, res, which](bool cancelled) {
+               auto* reg = session_.findRegion(id);
+               if (cancelled || !reg || id != repairRegion_) return;
+               if (!res->ok) { repairStatus_ = "!" + res->error; refreshRepair(); return; }
+               reg->patches.addArray(res->patches);
+               for (int i : which)
+                   if (juce::isPositiveAndBelow(i, repairItems_.size())) repairItems_.getReference(i).repaired = true;
+               repairStatus_ = res->report + "  Cmd+Z undoes it; Hear What Was Removed should be the faults alone.";
+               sessionChanged();
+               refreshRepair();
+           });
+}
+
+// After every take: what the engine counted while recording, then a look through the file for
+// repeated audio (the mark of a buffer fault). Says so either way.
+void MainComponent::checkTake(int regionId, juce::int64 lostSamples, int lostEvents, int dropouts) {
+    auto* r = session_.findRegion(regionId);
+    if (!r) return;
+    auto snapshot = std::make_shared<Region>(*r);
+    auto found = std::make_shared<juce::Array<RepairSpot>>();
+    const juce::String name = r->name;
+    runJob("Checking the take for dropouts...",
+           [this, snapshot, found](Job& j) {
+               for (auto& sp : scanTake(engine_.formats(), *snapshot, snapshot->srcIn, snapshot->srcOut, [&](double p) { return j.keep(p); }))
+                   if (sp.certain) found->add(sp);   // (breaks alone can be music: Check for Recording Faults lists those on request)
+           },
+           [this, found, regionId, lostSamples, lostEvents, dropouts, name](bool cancelled) {
+               if (!session_.findRegion(regionId)) return;
+               juce::StringArray lines;
+               if (lostSamples > 0)
+                   lines.add(juce::String(lostSamples) + " samples were lost in " + juce::String(lostEvents) + (lostEvents == 1 ? " place" : " places") +
+                             " because the disk couldn't keep up.");
+               if (dropouts > 0) lines.add("The interface reported " + juce::String(dropouts) + (dropouts == 1 ? " dropout." : " dropouts."));
+               if (!found->isEmpty())
+                   lines.add(juce::String(found->size()) + (found->size() == 1 ? " spot" : " spots") +
+                             " of repeated audio (a buffer fault between the interface and Lathe), marked on the timeline.");
+               if (lines.isEmpty()) {
+                   takeReport_ = cancelled ? juce::String() : "Take   " + name + ": recorded cleanly, no dropouts.";
+                   refreshIssues();
+                   return;
+               }
+               takeReport_ = "TAKE   " + name + ": " + lines.joinIntoString(" ");
+               refreshIssues();
+               if (!found->isEmpty()) {
+                   repairRegion_ = regionId;
+                   repairItems_.clear();
+                   for (auto& sp : *found) repairItems_.add({sp, true, false});
+                   repairStatus_ = "!This take has " + juce::String(found->size()) + (found->size() == 1 ? " fault" : " faults") +
+                                   ". Click one to hear it. Repair Ticked rebuilds them; recording again is the sure cure.";
+                   showRepair();
+               }
+               juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::WarningIcon, "This take has faults",
+                                                      lines.joinIntoString("\n\n") +
+                                                          "\n\nIf it keeps happening, raise the buffer size in Audio Setup and check the interface's connection.");
+           });
 }
 
 }  // namespace lathe

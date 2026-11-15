@@ -32,6 +32,46 @@ ClickStats declick(Channels& ch, double rate, double sensitivity, double maxClic
 // Crackle: many tiny impulses. Several low-threshold, short-gap passes.
 ClickStats decrackle(Channels& ch, double rate, double amount);
 
+// ---- Manual repair of a marked stretch -----------------------------------------------
+// All three work on a window of audio that includes context either side of the gap [g0, g1)
+// (at least a few thousand samples where possible) and change only the gap and, for the last
+// two, short blends at its edges. They return false (audio untouched) when they can't work.
+//
+// Interpolation: rebuilds the gap from an autoregressive model of the audio on both sides (the
+// least-squares solution, so it joins smoothly at both ends). Excellent up to about 20 ms; it
+// loses level in the middle of much longer gaps. At most kMaxInterpolate samples.
+constexpr int64_t kMaxInterpolate = 24000;
+bool interpolateGap(Channels& ch, int64_t g0, int64_t g1);
+// Replacement: finds the stretch nearby (within the window) whose surroundings best match the
+// gap's surroundings, and blends it in. For longer damage in repetitive material. `score`
+// (0..1) says how good the match was; below 0.35 nothing is changed.
+bool patchFromSimilar(Channels& ch, double rate, int64_t g0, int64_t g1, double* score = nullptr);
+// Thump: rebuilds only the low frequencies (below `cutoffHz`) across the gap and keeps
+// everything above as it was. For plosives, mic bumps and other low-frequency pops.
+bool dethump(Channels& ch, double rate, int64_t g0, int64_t g1, double cutoffHz = 150.0);
+
+// ---- Finding damage ----------------------------------------------------------------------
+struct ClickEvent {
+    int64_t start = 0, length = 0;   // samples
+    double strength = 0;             // how far above the surrounding level (1 = at the threshold)
+};
+// The clicks declick() would repair at this sensitivity, without changing anything.
+std::vector<ClickEvent> findClicks(const Channels& ch, double rate, double sensitivity, double maxClickMs);
+// Repairs exactly these (by interpolation). Returns how many were repaired.
+int repairClicks(Channels& ch, const std::vector<ClickEvent>& events);
+
+// Digital faults in a recording: a buffer of old audio played again (the same samples as `lag`
+// earlier, bit for bit), or a plain break in the waveform (lag 0). The first is certain; the
+// second can be a real transient, so it is only reported when it is far out of character.
+struct Glitch {
+    int64_t start = 0, length = 0;
+    int64_t lag = 0;      // > 0: repeated audio from this many samples earlier
+    double jump = 0;      // size of the step into it (linear)
+};
+// Scans win[from, to); samples before `from` are history (up to 2^18 are used to recognise
+// repeats). Positions are reported with `base` added. Appends to `out`.
+void scanGlitches(const Channels& win, size_t from, size_t to, int64_t base, std::vector<Glitch>& out);
+
 // ---- Broadband noise --------------------------------------------------------------
 struct NoiseProfile {
     int fftSize = 0;

@@ -459,17 +459,52 @@ void Session::insertLane(int at) {
     at = juce::jlimit(0, lanes, at);
     for (auto& r : regions)
         if (r.lane >= at) ++r.lane;
-    for (auto& l : lanesOff)
-        if (l >= at) ++l;
+    for (auto* list : {&lanesOff, &lanesMuted, &lanesSolo, &lanesGainOff, &lanesGainShown})
+        for (auto& l : *list)
+            if (l >= at) ++l;
     if (at < laneFormats.size()) laneFormats.insert(at, 2);
     ++lanes;
+}
+
+bool Session::deleteLane(int lane) {
+    if (lanes <= 1 || !juce::isPositiveAndBelow(lane, lanes)) return false;
+    for (auto& r : regions)
+        if (r.lane == lane) return false;
+    for (auto& r : regions)
+        if (r.lane > lane) --r.lane;
+    for (auto* list : {&lanesOff, &lanesMuted, &lanesSolo, &lanesGainOff, &lanesGainShown}) {
+        list->removeAllInstancesOf(lane);
+        for (auto& l : *list)
+            if (l > lane) --l;
+    }
+    if (lane < laneFormats.size()) laneFormats.remove(lane);
+    --lanes;
+    return true;
+}
+
+juce::String Session::laneStateWarning() const {
+    auto names = [](const juce::Array<int>& lanes) {
+        juce::StringArray n;
+        auto sorted = lanes;
+        sorted.sort();
+        for (int l : sorted) n.add(juce::String(l + 1));
+        return juce::String(n.size() == 1 ? "lane " : "lanes ") + n.joinIntoString(", ");
+    };
+    juce::StringArray parts;
+    if (!lanesSolo.isEmpty()) parts.add("only " + names(lanesSolo) + (lanesSolo.size() == 1 ? " is" : " are") + " playing (solo)");
+    else if (!lanesMuted.isEmpty()) parts.add(names(lanesMuted) + (lanesMuted.size() == 1 ? " is" : " are") + " muted");
+    juce::Array<int> flat;
+    for (int l : lanesGainOff)
+        if (laneAudible(l)) flat.add(l);
+    if (!flat.isEmpty()) parts.add(names(flat) + (flat.size() == 1 ? " has" : " have") + " gain changes switched off");
+    return parts.joinIntoString("; ");
 }
 
 juce::Array<int> Session::printAnchors() const {
     juce::Array<int> a;
     if (programmeChannels() == 6) return a;
     for (auto& r : regions)
-        if (!r.mute && r.afterGear != 0 && a.size() < 3) a.addIfNotAlreadyThere(r.afterGear);
+        if (!r.mute && laneAudible(r.lane) && r.afterGear != 0 && a.size() < 3) a.addIfNotAlreadyThere(r.afterGear);
     return a;
 }
 
@@ -488,7 +523,7 @@ int Session::usePrints(int gear, bool usePrint) {
 
 int Session::programmeChannels() const {
     for (auto& r : regions)
-        if (!r.mute && laneFormat(r.lane) == 6) return 6;
+        if (!r.mute && laneAudible(r.lane) && laneFormat(r.lane) == 6) return 6;
     return 2;
 }
 
@@ -1275,6 +1310,11 @@ juce::var Session::toVar() const {
         for (auto& p : r.envelope) env.add(juce::Array<juce::var>{p.t, p.db});
         o->setProperty("envelope", env);
         if (r.fxState.isNotEmpty()) o->setProperty("fx", r.fxState);
+        if (!r.patches.isEmpty()) {
+            juce::Array<juce::var> pl;
+            for (auto& p : r.patches) pl.add(juce::Array<juce::var>{p.pos, p.length, p.file, p.offset});
+            o->setProperty("patches", pl);
+        }
         if (r.afterGear != 0) {
             o->setProperty("afterGear", r.afterGear);
             juce::Array<juce::var> po;
@@ -1375,6 +1415,16 @@ juce::var Session::toVar() const {
     juce::Array<juce::var> off;
     for (int l : lanesOff) off.add(l);
     root->setProperty("lanesOff", off);
+    auto laneList = [&](const char* key, const juce::Array<int>& list) {
+        if (list.isEmpty()) return;
+        juce::Array<juce::var> a;
+        for (int l : list) a.add(l);
+        root->setProperty(key, a);
+    };
+    laneList("lanesMuted", lanesMuted);
+    laneList("lanesSolo", lanesSolo);
+    laneList("lanesGainOff", lanesGainOff);
+    laneList("lanesGainShown", lanesGainShown);
     bool anyFormat = false;
     for (int f : laneFormats) anyFormat = anyFormat || f != 2;
     if (anyFormat) {
@@ -1404,6 +1454,10 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     gainNodes.clear();
     gainBypass = lockGain = false;
     lanesOff.clear();
+    lanesMuted.clear();
+    lanesSolo.clear();
+    lanesGainOff.clear();
+    lanesGainShown.clear();
     laneFormats.clear();
     sourceDoc = juce::var();
     nextId = 1;
@@ -1486,6 +1540,9 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
             if (auto* env = o["envelope"].getArray())
                 for (auto& p : *env) r.envelope.add({double(p[0]), double(p[1])});
             r.fxState = o["fx"].toString();
+            if (auto* pl = o["patches"].getArray())
+                for (auto& p : *pl)
+                    if (p.isArray() && p.size() == 4 && int(p[1]) > 0) r.patches.add({juce::int64(p[0]), int(p[1]), p[2].toString(), juce::int64(p[3])});
             r.afterGear = int(o.getProperty("afterGear", 0));
             if (auto* po = o["printOf"].getArray())
                 for (auto& id : *po) r.printOf.add(int(id));
@@ -1607,6 +1664,15 @@ bool Session::fromVar(const juce::var& v, juce::String& error) {
     lockGain = bool(v.getProperty("lockGain", false));
     if (auto* arr = v["lanesOff"].getArray())
         for (auto& l : *arr) lanesOff.addIfNotAlreadyThere(int(l));
+    auto laneList = [&](const char* key, juce::Array<int>& list) {
+        if (auto* arr = v[key].getArray())
+            for (auto& l : *arr)
+                if (int(l) >= 0) list.addIfNotAlreadyThere(int(l));
+    };
+    laneList("lanesMuted", lanesMuted);
+    laneList("lanesSolo", lanesSolo);
+    laneList("lanesGainOff", lanesGainOff);
+    laneList("lanesGainShown", lanesGainShown);
     if (auto* arr = v["laneFormats"].getArray())
         for (int i = 0; i < arr->size(); ++i) setLaneFormat(i, int(arr->getReference(i)));
     sourceDoc = v["source"];
