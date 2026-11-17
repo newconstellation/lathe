@@ -228,6 +228,14 @@ TPDF dither (flat, light or strong noise shaping) → 16-bit.
   - the plugin buttons sit directly under the plugin list, with a labelled "Problems & notes" box
     below.
 
+## Signed and notarized installers (v0.16.1)
+
+- Lathe now comes as a disk image (open it, drag Lathe to Applications) and as an installer
+  package, both signed with a Developer ID and notarized by Apple: no more right-click > Open
+  or security warnings, on any Mac.
+- The first time a signed Lathe records, macOS asks once more for permission to use the
+  audio inputs, because the signature has changed.
+
 ## Align, lane heights, deeper zoom, Zoom to Region (v0.16)
 
 - **Align Regions** (Edit > Align Regions..., Cmd+Option+A). Select the region the others
@@ -325,8 +333,32 @@ CD-R burning, Japanese (MS-JIS) CD-Text, and a sign-off sheet.
 
 ## Building
 
-GitHub Actions builds a universal (Apple Silicon + Intel) app on every push to `main`
-and publishes `Lathe-mac.zip` to the `builds` branch. Runs on macOS 10.15 Catalina or later, Intel or Apple Silicon.
+GitHub Actions builds a universal (Apple Silicon + Intel) app on every push to `main` and
+publishes it to the `builds` branch as:
+
+- `Lathe-<version>.dmg`: open it and drag Lathe onto Applications.
+- `Lathe-<version>.pkg`: an installer that puts Lathe in Applications.
+- `Lathe-mac.zip`: the app on its own.
+
+`BUILD_INFO.txt` says what was signed and notarized. Runs on macOS 10.15 Catalina or later,
+Intel or Apple Silicon.
+
+### Signing
+
+`scripts/package-mac.sh` signs with a Developer ID, runs under Apple's hardened runtime
+(`resources/Lathe.entitlements`: audio input, and loading other companies' plugins), has Apple
+notarize the app, disk image and package, and staples the tickets. It reads these repository
+secrets:
+
+| Secret | What |
+|---|---|
+| `MACOS_CERTS_P12` | base64 of a `.p12` export holding the *Developer ID Application* certificate (and *Developer ID Installer*, for a signed package) with private keys |
+| `MACOS_CERTS_PASSWORD` | the `.p12` password |
+| `APPLE_ID` | the Apple ID of the developer account |
+| `APPLE_TEAM_ID` | the 10-character Team ID |
+| `APPLE_APP_PASSWORD` | an app-specific password for that Apple ID |
+
+Without them the build still completes, with an ad-hoc signature and nothing notarized.
 
 Locally: `cmake -S . -B build && cmake --build build`.
 

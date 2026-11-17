@@ -62,36 +62,47 @@ jobs:
           echo "---- app as helper ----"
           cat "${{ runner.temp }}/scan-app.log" || true
 
-      - name: Package
+      - name: Check the app
         run: |
           APP=$(find build -name "Lathe.app" -type d | grep Release | head -1)
           # The MP3 encoder must be inside the app, for both kinds of Mac.
           test -x "$APP/Contents/Resources/lame"
           lipo -info "$APP/Contents/Resources/lame" | grep -q "x86_64 arm64\|arm64 x86_64"
           "$APP/Contents/Resources/lame" --version | head -1
-          codesign --force --deep --sign - "$APP"
-          mkdir -p dist
-          ditto -c -k --keepParent "$APP" dist/Lathe-mac.zip
-          ls -la dist
           lipo -info "$APP/Contents/MacOS/Lathe"
           vtool -show-build "$APP/Contents/MacOS/Lathe" | grep -E "minos|sdk"
           /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "$APP/Contents/Info.plist"
 
+      # Developer ID signature, Apple notarization, and the disk image and installer package.
+      - name: Sign, notarize and make the installers
+        env:
+          MACOS_CERTS_P12: ${{ secrets.MACOS_CERTS_P12 }}
+          MACOS_CERTS_PASSWORD: ${{ secrets.MACOS_CERTS_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: bash scripts/package-mac.sh
+
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/lathe-signing.keychain-db" 2>/dev/null || true
+
       - uses: actions/upload-artifact@v4
         with:
           name: Lathe-mac
-          path: dist/Lathe-mac.zip
+          path: dist/
 
       - name: Publish to builds branch
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
-          cp dist/Lathe-mac.zip /tmp/
+          mkdir -p /tmp/lathe-dist && cp dist/* /tmp/lathe-dist/
           git fetch origin builds || true
           git checkout --orphan builds-new
           git rm -rf --quiet . || true
-          cp /tmp/Lathe-mac.zip .
-          echo "Built from ${GITHUB_SHA} on $(date -u)" > BUILD_INFO.txt
-          git add Lathe-mac.zip BUILD_INFO.txt
+          cp /tmp/lathe-dist/* .
+          { echo "Built from ${GITHUB_SHA} on $(date -u)"; cat SIGNING.txt; } > BUILD_INFO.txt
+          rm SIGNING.txt
+          git add Lathe-mac.zip Lathe-*.dmg Lathe-*.pkg BUILD_INFO.txt
           git commit -m "Build ${GITHUB_SHA::7}"
           git push --force origin builds-new:builds
