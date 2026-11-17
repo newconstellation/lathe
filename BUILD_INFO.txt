@@ -1,0 +1,5 @@
+Built from a11039457fb58925a7b280fc45b3da1274cceb4a on Tue Nov 17 18:27:24 UTC 2026
+Lathe 0.16.1
+App: ad-hoc signature only (no certificate in the repository's secrets)
+Not notarized
+Installer package: unsigned (needs a Developer ID Installer certificate)
